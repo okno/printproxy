@@ -445,7 +445,10 @@ sync -f /etc/systemd/system
 sync -f /usr/local/libexec
 
 systemd-analyze verify /etc/systemd/system/printproxy.service /etc/systemd/system/printproxy-vip.service /etc/systemd/system/printproxy-firewall.service /etc/systemd/system/printproxy-vip-watch.service /etc/systemd/system/printproxy-vip-watch.timer
-logrotate --debug /etc/logrotate.d/printproxy >/dev/null
+if ! LOGROTATE_CHECK_OUTPUT=$(logrotate --debug /etc/logrotate.d/printproxy 2>&1); then
+    printf '%s\n' "$LOGROTATE_CHECK_OUTPUT" >&2
+    die 'logrotate configuration validation failed'
+fi
 systemctl daemon-reload
 systemctl enable printproxy-vip.service printproxy-firewall.service printproxy-vip-watch.timer printproxy.service >/dev/null
 /usr/local/libexec/printproxy-vip up
@@ -460,8 +463,22 @@ else
     warn 'Clock is not reported synchronized. UTC timestamps remain local audit timestamps, not certified timestamps.'
 fi
 
-systemctl is-active --quiet printproxy.service || die 'printproxy.service did not become active'
-ss -H -ltn "sport = :$LISTEN_PORT" | grep -Fq "$VIP:$LISTEN_PORT" || die 'configured listener socket is not active'
+listener_ready=no
+for ((listener_attempt = 1; listener_attempt <= 40; listener_attempt++)); do
+    if systemctl is-active --quiet printproxy.service && \
+       ss -H -ltn4 "sport = :$LISTEN_PORT" | \
+           awk -v endpoint="$VIP:$LISTEN_PORT" '$4 == endpoint { found=1 } END { exit !found }'; then
+        listener_ready=yes
+        break
+    fi
+    sleep 0.25
+done
+if [[ $listener_ready != yes ]]; then
+    systemctl --no-pager --full status printproxy.service >&2 || true
+    ss -H -ltn4 "sport = :$LISTEN_PORT" >&2 || true
+    journalctl -u printproxy.service -n 30 --no-pager >&2 || true
+    die 'configured listener socket did not become active within 10 seconds'
+fi
 /usr/local/sbin/printproxyctl status || die 'post-install service/head health check failed'
 systemctl --no-pager --full status printproxy.service
 log "Installed successfully. Listener: $VIP:$LISTEN_PORT -> printer $PRINTER_IP:$PRINTER_PORT"
