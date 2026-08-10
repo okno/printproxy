@@ -74,7 +74,7 @@ sudo apt-get update
 sudo apt-get install --no-install-recommends -y git ca-certificates
 git clone https://github.com/okno/printproxy.git /srv/printproxy-src
 cd /srv/printproxy-src
-git switch --detach v1.0.0
+git switch --detach v1.0.1
 chmod +x install.sh uninstall.sh
 sudo ./install.sh
 ```

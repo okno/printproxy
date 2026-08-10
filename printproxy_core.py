@@ -504,8 +504,26 @@ def write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
-def read_regular_file_bytes(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> bytes:
+def _open_regular_for_read(path: Path) -> int:
+    """Open one regular, non-symlink inode; O_NOFOLLOW closes the Unix race."""
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise StorageError(f"not a regular non-symlink file: {path}")
     fd = os.open(path, _open_flags(os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)))
+    try:
+        after = os.fstat(fd)
+        if not stat.S_ISREG(after.st_mode):
+            raise StorageError(f"not a regular file: {path}")
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            raise StorageError(f"file changed while opening: {path}")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_regular_file_bytes(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> bytes:
+    fd = _open_regular_for_read(path)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
@@ -612,7 +630,7 @@ def durable_move(source: Path, destination: Path) -> None:
 def sha256_file(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
-    fd = os.open(path, _open_flags(os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)))
+    fd = _open_regular_for_read(path)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise StorageError(f"not a regular file: {path}")

@@ -46,7 +46,7 @@ specifico commit, non una revisione non registrata della branch corrente:
 cd /srv/printproxy-src
 git fetch --tags --prune origin
 git tag --list
-RELEASE_REF='v1.0.0'
+RELEASE_REF='v1.0.1'
 git switch --detach "$RELEASE_REF"
 git show --no-patch --decorate --oneline HEAD
 git rev-parse HEAD
@@ -269,7 +269,7 @@ git rev-parse HEAD | sudo tee "$ROLLBACK_BACKUP/source.commit" >/dev/null
 
 git status --short
 git fetch --tags --prune origin
-GOOD_REF='v1.0.0'
+GOOD_REF='v1.0.1'
 git switch --detach "$GOOD_REF"
 git show --no-patch --decorate --oneline HEAD
 sudo ./install.sh
