@@ -36,7 +36,7 @@ case "${VERSION_ID:-}" in
 esac
 [[ -d /run/systemd/system ]] || die 'systemd is required'
 
-declare -a packages=(python3 iproute2 util-linux iputils-arping logrotate)
+declare -a packages=(python3 python3-reportlab iproute2 util-linux iputils-arping logrotate)
 declare -a missing=()
 for package in "${packages[@]}"; do
     dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || missing+=("$package")
@@ -48,12 +48,14 @@ if ((${#missing[@]})); then
     apt-get install --no-install-recommends -y "${missing[@]}"
 fi
 
-python3 - <<'PY' || die 'Python 3.11 or newer is required'
+python3 - <<'PY' || die 'Python 3.11+ with ReportLab is required'
 import sys
 assert sys.version_info >= (3, 11), sys.version
+import reportlab
 PY
 
-[[ -f "$PROJECT_DIR/printproxy.py" && -f "$PROJECT_DIR/printproxy_core.py" ]] || die 'run install.sh from the complete project directory'
+[[ -f "$PROJECT_DIR/printproxy.py" && -f "$PROJECT_DIR/printproxy_core.py" && \
+   -f "$PROJECT_DIR/receipt_renderer.py" ]] || die 'run install.sh from the complete project directory'
 
 if ! getent group printproxy >/dev/null 2>&1; then
     groupadd --system printproxy
@@ -97,8 +99,19 @@ LOG_DIR=$(conf_get LOG_DIR)
 HMAC_KEY_FILE=$(conf_get HMAC_KEY_FILE)
 ENABLE_FIREWALL=$(conf_get ENABLE_FIREWALL)
 PROTOCOL=$(conf_get PROXY_PROTOCOL)
+DELIVERY_MODE=$(conf_get DELIVERY_MODE)
 
 [[ $PROTOCOL == raw ]] || die 'only PROXY_PROTOCOL=raw is supported safely'
+if [[ -z $DELIVERY_MODE ]]; then
+    die 'existing config predates bidirectional delivery. Add DELIVERY_MODE=transparent_duplex (recommended after queue review) or DELIVERY_MODE=store_forward explicitly; compare /etc/printproxy/printproxy.conf.dist'
+fi
+case "$DELIVERY_MODE" in
+    transparent_duplex) ;;
+    store_forward)
+        warn 'DELIVERY_MODE=store_forward is explicitly selected: printer responses are not relayed to the client.'
+        ;;
+    *) die 'DELIVERY_MODE must be transparent_duplex or store_forward' ;;
+esac
 [[ $HMAC_KEY_FILE == /etc/printproxy/integrity.key ]] || die 'installer requires HMAC_KEY_FILE=/etc/printproxy/integrity.key'
 for path in "$DATA_DIR" "$SPOOL_DIR" "$LOG_DIR"; do
     [[ $path =~ ^/[A-Za-z0-9._/-]+$ && $path != / ]] || die "unsafe service path: $path"
@@ -308,7 +321,8 @@ backup_if_present() {
     fi
 }
 for target in \
-    "$OPT_DIR/printproxy.py" "$OPT_DIR/printproxy_core.py" "$OPT_DIR/printproxyctl.py" \
+    "$OPT_DIR/printproxy.py" "$OPT_DIR/printproxy_core.py" "$OPT_DIR/receipt_renderer.py" \
+    "$OPT_DIR/printproxyctl.py" \
     /etc/systemd/system/printproxy.service /etc/systemd/system/printproxy-vip.service \
     /etc/systemd/system/printproxy-firewall.service /etc/logrotate.d/printproxy \
     /etc/systemd/system/printproxy-vip-watch.service /etc/systemd/system/printproxy-vip-watch.timer \
@@ -322,6 +336,7 @@ find "$BACKUP_DIR" -type f ! -name MANIFEST.sha256 -print0 | sort -z | \
 
 install -m 0755 -o root -g root "$PROJECT_DIR/printproxy.py" "$OPT_DIR/printproxy.py"
 install -m 0644 -o root -g root "$PROJECT_DIR/printproxy_core.py" "$OPT_DIR/printproxy_core.py"
+install -m 0644 -o root -g root "$PROJECT_DIR/receipt_renderer.py" "$OPT_DIR/receipt_renderer.py"
 install -m 0755 -o root -g root "$PROJECT_DIR/printproxyctl.py" "$OPT_DIR/printproxyctl.py"
 [[ -f $PROJECT_DIR/README.md ]] && install -m 0644 -o root -g root "$PROJECT_DIR/README.md" "$OPT_DIR/README.md"
 install -d -m 0755 -o root -g root "$OPT_DIR/docs"

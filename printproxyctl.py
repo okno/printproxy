@@ -22,11 +22,10 @@ _SCRIPT_DIRECTORY = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIRECTORY not in sys.path:
     sys.path.insert(0, _SCRIPT_DIRECTORY)
 
-from printproxy_core import (
+from printproxy_core import (  # noqa: E402
     ConfigError,
     IntegrityError,
     IntegrityLedger,
-    SAFE_RETRY_STATES,
     StateStore,
     StorageError,
     atomic_write_bytes,
@@ -134,6 +133,7 @@ def command_status(settings: Any, _arguments: argparse.Namespace) -> int:
         )
 
     print(f"Service:              {active} ({active_detail})")
+    print(f"Delivery mode:        {settings.delivery_mode}")
     print(f"Listener:             {settings.listen_ip}:{settings.listen_port}")
     print(
         f"Printer:              {'reachable' if printer_ok else 'UNREACHABLE'} "
@@ -222,6 +222,7 @@ def command_retry(settings: Any, arguments: argparse.Namespace) -> int:
             state
             for state in store.list()
             if state.get("state") in {"QUEUED", "FAILED_BEFORE_SEND"}
+            and state.get("retry_allowed") is not False
         ]
     elif arguments.job_id:
         try:
@@ -236,6 +237,13 @@ def command_retry(settings: Any, arguments: argparse.Namespace) -> int:
     created = 0
     for state in targets:
         current = state.get("state")
+        if state.get("retry_allowed") is False:
+            print(
+                f"REFUSED {state['job_id']}: transparent-duplex transcripts are not "
+                "safe one-way replay jobs; start a new session from the gestionale",
+                file=sys.stderr,
+            )
+            continue
         if current == "UNKNOWN_PRINT_STATE" and not arguments.confirm_unknown:
             print(
                 f"REFUSED {state['job_id']}: physical outcome is unknown; "

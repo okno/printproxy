@@ -14,6 +14,7 @@ from printproxy_core import (  # noqa: E402
     durable_move,
     ensure_runtime_directories,
     load_settings,
+    read_regular_file_prefix,
     retention_eligible,
     sha256_file,
 )
@@ -51,6 +52,16 @@ class SpoolTests(unittest.TestCase):
         digest, size = sha256_file(destination)
         self.assertEqual(size, len(payload))
         self.assertEqual(len(digest), 64)
+
+    def test_bounded_regular_file_prefix_reports_truncation(self) -> None:
+        source = self.settings.data_dir / "bounded.raw"
+        atomic_write_bytes(source, b"0123456789")
+        value, truncated = read_regular_file_prefix(source, max_bytes=4)
+        self.assertEqual(value, b"0123")
+        self.assertTrue(truncated)
+        value, truncated = read_regular_file_prefix(source, max_bytes=10)
+        self.assertEqual(value, b"0123456789")
+        self.assertFalse(truncated)
 
     def test_retention_only_allows_successful_terminal_jobs(self) -> None:
         old = "2000-01-01T00:00:00.000000Z"

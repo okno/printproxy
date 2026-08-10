@@ -32,11 +32,12 @@ _SCRIPT_DIRECTORY = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIRECTORY not in sys.path:
     sys.path.insert(0, _SCRIPT_DIRECTORY)
 
-from printproxy_core import (
+from printproxy_core import (  # noqa: E402
     ConfigError,
     IntegrityError,
     IntegrityLedger,
     SAFE_RETRY_STATES,
+    STATE_SCHEMA_VERSION,
     STATE_LATEST_EVENTS,
     StateStore,
     StorageError,
@@ -57,12 +58,18 @@ from printproxy_core import (
     metadata_document_from_state,
     readable_file,
     read_regular_file_bytes,
+    read_regular_file_prefix,
     release_emergency_reserve,
     retention_eligible,
     safe_error,
     service_instance_lock,
     sha256_file,
     utc_now,
+)
+from receipt_renderer import (  # noqa: E402
+    ParseLimits,
+    RealtimeStatusBlock,
+    render_receipt_artifacts,
 )
 
 
@@ -93,6 +100,16 @@ def configure_logging(settings: Settings) -> None:
         LOG.addHandler(file_handler)
 
 
+async def durable_to_thread(function: Any, *args: Any) -> Any:
+    """Finish an in-flight fd operation before propagating cancellation."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+
+
 @dataclass
 class ReceiveResult:
     state: dict[str, Any]
@@ -102,6 +119,491 @@ class ReceiveResult:
     idle_timeout_triggered: bool
     connection_closed: bool
     cancelled: bool = False
+
+
+class LiveRelayError(OSError):
+    """A live printer stream failed after delivery may have started."""
+
+
+class LivePrinterRelay:
+    """One byte-transparent printer connection for one accepted client session."""
+
+    def __init__(
+        self,
+        service: "PrintProxyService",
+        client_writer: asyncio.StreamWriter,
+        session_id: str,
+        source: str,
+    ) -> None:
+        self.service = service
+        self.settings = service.settings
+        self.client_writer = client_writer
+        self.session_id = session_id
+        self.source = source
+        self.destination = f"{self.settings.printer_ip}:{self.settings.printer_port}"
+        self.printer_reader: asyncio.StreamReader | None = None
+        self.printer_writer: asyncio.StreamWriter | None = None
+        self.response_task: asyncio.Task[None] | None = None
+        self.lock_acquired = False
+        self.closed = False
+        self.printer_write_eof_sent = False
+        self.connect_attempted = False
+        self.connect_error: BaseException | None = None
+        self.stream_error: BaseException | None = None
+        self.printer_fin_received = False
+        self.printer_reset_received = False
+        self.printer_close_kind: str | None = None
+        self.client_response_closed = False
+        self.client_drain_pending = False
+        self.bytes_client_to_printer = 0
+        self.bytes_submitted_to_socket = 0
+        self.bytes_printer_to_client = 0
+        self._response_activity = asyncio.Event()
+        self.failure_event = asyncio.Event()
+        self._job_id: str | None = None
+        self._job_state: dict[str, Any] | None = None
+        self._job_response_bytes = 0
+        self._job_bytes_rx_from_printer = 0
+        self._job_bytes_submitted_to_client = 0
+        self._job_response_capture = bytearray()
+        self._job_response_truncated = False
+        self._job_response_rx_digest = hashlib.sha256()
+        self._job_response_delivered_digest = hashlib.sha256()
+        self._job_realtime_queries = 0
+        self._job_query_tail = b""
+
+    def begin_job(self, state: dict[str, Any]) -> None:
+        if self._job_state is not None:
+            # Responses can arrive after an idle archive boundary while the
+            # same TCP session waits for its next request. Snapshot that tail
+            # into the preceding job immediately before counters are reset.
+            self.snapshot_job(self._job_state)
+            self._job_response_bytes = 0
+            self._job_bytes_rx_from_printer = 0
+            self._job_bytes_submitted_to_client = 0
+            self._job_response_capture.clear()
+            self._job_response_truncated = False
+            self._job_response_rx_digest = hashlib.sha256()
+            self._job_response_delivered_digest = hashlib.sha256()
+            self._job_realtime_queries = 0
+            self._job_query_tail = b""
+        self._job_id = str(state["job_id"])
+        self._job_state = state
+        state.update(
+            {
+                "bytes_client_to_printer": 0,
+                "bytes_printer_to_client": 0,
+                "bytes_printer_received": 0,
+                "bytes_submitted_to_client": 0,
+                "printer_response_hex": "",
+                "printer_response_truncated": False,
+                "printer_response_sha256": hashlib.sha256(b"").hexdigest(),
+                "printer_response_delivered_sha256": hashlib.sha256(b"").hexdigest(),
+                "realtime_status_queries": 0,
+                "client_fin_received": False,
+                "printer_fin_received": self.printer_fin_received,
+                "client_close_kind": None,
+                "printer_close_kind": self.printer_close_kind,
+                "full_duplex": True,
+                "retry_allowed": False,
+            }
+        )
+        # If the printer emitted server-first/ASB bytes after upstream connect,
+        # the first job adopts those already-relayed bytes instead of losing
+        # them from counters and digests.
+        self.snapshot_job(state)
+
+    def end_job(self, job_id: str) -> None:
+        if self._job_id == job_id:
+            if self._job_state is not None:
+                self.snapshot_job(self._job_state)
+            self._job_id = None
+            self._job_state = None
+            self._job_response_capture.clear()
+            self._job_query_tail = b""
+
+    def _record_realtime_queries(self, data: bytes) -> None:
+        combined = self._job_query_tail + data
+        # DLE EOT n is a three-byte request. Keeping two bytes handles a
+        # request split at either TCP packet boundary without touching data.
+        for index in range(max(0, len(combined) - 2)):
+            if (
+                combined[index : index + 2] == b"\x10\x04"
+                and combined[index + 2] in {1, 2, 3, 4}
+            ):
+                self._job_realtime_queries += 1
+        self._job_query_tail = combined[-2:]
+
+    def snapshot_job(self, state: dict[str, Any]) -> None:
+        state["bytes_client_to_printer"] = int(state.get("bytes_forwarded", 0))
+        state["bytes_printer_to_client"] = self._job_response_bytes
+        state["bytes_printer_received"] = self._job_bytes_rx_from_printer
+        state["bytes_submitted_to_client"] = self._job_bytes_submitted_to_client
+        state["printer_response_hex"] = bytes(self._job_response_capture).hex()
+        state["printer_response_truncated"] = self._job_response_truncated
+        state["printer_response_sha256"] = self._job_response_rx_digest.hexdigest()
+        state["printer_response_delivered_sha256"] = (
+            self._job_response_delivered_digest.hexdigest()
+        )
+        state["realtime_status_queries"] = self._job_realtime_queries
+        state["printer_fin_received"] = self.printer_fin_received
+        state["printer_close_kind"] = self.printer_close_kind
+        if self.stream_error is not None:
+            state["last_error"] = safe_error(self.stream_error)
+
+    def _log_payload(self, direction: str, data: bytes) -> None:
+        fields: dict[str, Any] = {
+            "timestamp": utc_now(),
+            "session_id": self.session_id,
+            "direction": direction,
+            "source": self.source if direction == "CLIENT_TO_PRINTER" else self.destination,
+            "destination": self.destination if direction == "CLIENT_TO_PRINTER" else self.source,
+            "bytes": len(data),
+        }
+        if self.settings.debug_hexdump:
+            limit = self.settings.debug_hexdump_max_bytes
+            fields["hex"] = data[:limit].hex()
+            fields["hex_truncated"] = len(data) > limit
+            log_event(logging.INFO, "TCP_PAYLOAD", **fields)
+        else:
+            log_event(logging.DEBUG, "TCP_PAYLOAD", **fields)
+
+    async def _connect(self) -> bool:
+        if self.printer_writer is not None:
+            return True
+        if self.connect_attempted:
+            return False
+        self.connect_attempted = True
+        if self.service.printer_session_lock.locked():
+            self.connect_error = ConnectionRefusedError("printer session is busy")
+            log_event(
+                logging.WARNING,
+                "DUPLEX_REJECTED_BUSY",
+                timestamp=utc_now(),
+                session_id=self.session_id,
+                source=self.source,
+                destination=self.destination,
+            )
+            return False
+        await self.service.printer_session_lock.acquire()
+        self.lock_acquired = True
+        try:
+            self.printer_reader, self.printer_writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    self.settings.printer_ip,
+                    self.settings.printer_port,
+                    limit=self.settings.chunk_size,
+                ),
+                timeout=self.settings.connect_timeout,
+            )
+        except asyncio.CancelledError:
+            self._release_lock()
+            raise
+        except Exception as exc:
+            self.connect_error = exc
+            self._release_lock()
+            log_event(
+                logging.ERROR,
+                "PRINTER_CONNECT_FAILED",
+                timestamp=utc_now(),
+                session_id=self.session_id,
+                source=self.source,
+                destination=self.destination,
+                error=safe_error(exc),
+            )
+            return False
+        log_event(
+            logging.INFO,
+            "PRINTER_SESSION_OPEN",
+            timestamp=utc_now(),
+            session_id=self.session_id,
+            source=self.source,
+            destination=self.destination,
+        )
+        self.response_task = asyncio.create_task(
+            self._relay_printer_responses(), name=f"printer-to-client-{self.session_id}"
+        )
+        return True
+
+    async def open(self) -> bool:
+        """Open upstream before consuming client bytes (server-first safe)."""
+        return await self._connect()
+
+    def _arm_send(self, state: dict[str, Any]) -> None:
+        if state.get("attempt_id") is not None:
+            return
+        state["state"] = "DUPLEX_ACTIVE"
+        state["attempts"] = int(state.get("attempts", 0)) + 1
+        state["attempt_id"] = str(uuid.uuid4())
+        state["forward_status"] = "live_send_armed_unconfirmed"
+        state["bytes_submitted_to_socket"] = 0
+        state["bytes_forwarded"] = 0
+        state["next_retry_at"] = None
+        state["next_retry_epoch"] = None
+        state["last_error"] = None
+        state["retry_allowed"] = False
+        # This HMAC-authenticated ledger marker precedes the first
+        # writer.write(). Recovery treats it as UNKNOWN even if the process
+        # dies in the tiny marker/write window; false uncertainty is safer
+        # than a duplicate.
+        self.service._persist_state_event(state, "DUPLEX_ACTIVE")
+
+    async def send(self, state: dict[str, Any], data: bytes) -> bool:
+        if not data:
+            return True
+        if self.stream_error is not None:
+            raise LiveRelayError(safe_error(self.stream_error)) from self.stream_error
+        if not await self._connect():
+            state["last_error"] = safe_error(self.connect_error or RuntimeError("printer unavailable"))
+            state["forward_status"] = "live_failed_before_send_no_auto_retry"
+            return False
+        assert self.printer_writer is not None
+        self._arm_send(state)
+        self._record_realtime_queries(data)
+        # From this point onward the kernel may have accepted any prefix. Never
+        # classify a later failure as retry-safe.
+        state["bytes_submitted_to_socket"] = int(state.get("bytes_submitted_to_socket", 0)) + len(data)
+        self.bytes_submitted_to_socket += len(data)
+        try:
+            self.printer_writer.write(data)
+            await asyncio.wait_for(
+                self.printer_writer.drain(), timeout=self.settings.forward_timeout
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.stream_error = exc
+            state["last_error"] = safe_error(exc)
+            state["forward_status"] = "live_send_unknown"
+            raise LiveRelayError(safe_error(exc)) from exc
+        state["bytes_forwarded"] = int(state.get("bytes_forwarded", 0)) + len(data)
+        self.bytes_client_to_printer += len(data)
+        self._log_payload("CLIENT_TO_PRINTER", data)
+        return True
+
+    async def _relay_printer_responses(self) -> None:
+        assert self.printer_reader is not None
+        try:
+            while True:
+                try:
+                    data = await self.printer_reader.read(self.settings.chunk_size)
+                except asyncio.CancelledError:
+                    raise
+                except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+                    self.stream_error = exc
+                    self.printer_reset_received = isinstance(exc, ConnectionResetError)
+                    self.printer_close_kind = "rst" if self.printer_reset_received else "error"
+                    log_event(
+                        logging.WARNING,
+                        "TCP_RST" if self.printer_reset_received else "TCP_STREAM_ERROR",
+                        timestamp=utc_now(),
+                        session_id=self.session_id,
+                        direction="PRINTER_TO_CLIENT",
+                        source=self.destination,
+                        destination=self.source,
+                        error=safe_error(exc),
+                    )
+                    self.failure_event.set()
+                    self.service._force_reset(self.client_writer)
+                    self.client_writer.close()
+                    return
+                if not data:
+                    self.printer_fin_received = True
+                    self.printer_close_kind = "fin"
+                    log_event(
+                        logging.INFO,
+                        "TCP_FIN",
+                        timestamp=utc_now(),
+                        session_id=self.session_id,
+                        direction="PRINTER_TO_CLIENT",
+                        source=self.destination,
+                        destination=self.source,
+                    )
+                    if self.client_writer.can_write_eof():
+                        with contextlib.suppress(OSError, RuntimeError):
+                            self.client_writer.write_eof()
+                    return
+                self.bytes_printer_to_client += len(data)
+                self._job_bytes_rx_from_printer += len(data)
+                self._job_response_rx_digest.update(data)
+                remaining = (
+                    self.settings.max_printer_response_capture_bytes
+                    - len(self._job_response_capture)
+                )
+                if remaining > 0:
+                    self._job_response_capture.extend(data[:remaining])
+                if len(data) > remaining:
+                    self._job_response_truncated = True
+                self._job_bytes_submitted_to_client += len(data)
+                try:
+                    self.client_drain_pending = True
+                    self.client_writer.write(data)
+                    await asyncio.wait_for(
+                        self.client_writer.drain(), timeout=self.settings.forward_timeout
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+                    self.stream_error = exc
+                    self.client_response_closed = True
+                    log_event(
+                        logging.WARNING,
+                        "TCP_RST" if isinstance(exc, ConnectionResetError) else "TCP_STREAM_ERROR",
+                        timestamp=utc_now(),
+                        session_id=self.session_id,
+                        direction="PRINTER_TO_CLIENT",
+                        source=self.destination,
+                        destination=self.source,
+                        failed_endpoint="client",
+                        error=safe_error(exc),
+                    )
+                    self.failure_event.set()
+                    self.service._force_reset(self.client_writer)
+                    self.client_writer.close()
+                    return
+                finally:
+                    self.client_drain_pending = False
+                    self._response_activity.set()
+                self._job_response_bytes += len(data)
+                self._job_response_delivered_digest.update(data)
+                self._log_payload("PRINTER_TO_CLIENT", data)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._response_activity.set()
+
+    async def _wait_for_response_tail(self) -> bool:
+        """Return true when a pending reader may be cancelled after clean idle."""
+
+        task = self.response_task
+        if task is None or task.done():
+            if task is not None:
+                with contextlib.suppress(Exception):
+                    await task
+            return True
+        total_deadline = time.monotonic() + self.settings.forward_timeout
+        while not task.done():
+            remaining = total_deadline - time.monotonic()
+            if remaining <= 0:
+                if self.stream_error is None:
+                    self.stream_error = TimeoutError(
+                        "printer response relay exceeded total close deadline"
+                    )
+                self.failure_event.set()
+                log_event(
+                    logging.WARNING,
+                    "TCP_TIMEOUT",
+                    timestamp=utc_now(),
+                    session_id=self.session_id,
+                    direction="PRINTER_TO_CLIENT",
+                    timeout=f"{self.settings.forward_timeout}s",
+                    reason="total_response_deadline",
+                )
+                return False
+            self._response_activity.clear()
+            try:
+                await asyncio.wait_for(
+                    self._response_activity.wait(),
+                    timeout=min(self.settings.printer_response_timeout, remaining),
+                )
+            except asyncio.TimeoutError:
+                if self.client_drain_pending:
+                    # Data is actively being back-pressured to the client; it
+                    # is not an idle reverse stream and must not be truncated.
+                    continue
+                log_event(
+                    logging.INFO,
+                    "TCP_TIMEOUT",
+                    timestamp=utc_now(),
+                    session_id=self.session_id,
+                    direction="PRINTER_TO_CLIENT",
+                    timeout=f"{self.settings.printer_response_timeout}s",
+                    reason="response_idle",
+                )
+                return True
+        with contextlib.suppress(Exception):
+            await task
+        return True
+
+    async def half_close_printer(self, reason: str) -> None:
+        if self.printer_writer is None or self.printer_write_eof_sent:
+            return
+        if not self.printer_writer.can_write_eof():
+            return
+        self.printer_write_eof_sent = True
+        try:
+            self.printer_writer.write_eof()
+            await asyncio.wait_for(
+                self.printer_writer.drain(), timeout=self.settings.forward_timeout
+            )
+            log_event(
+                logging.INFO,
+                "TCP_FIN",
+                timestamp=utc_now(),
+                session_id=self.session_id,
+                direction="CLIENT_TO_PRINTER",
+                source=self.source,
+                destination=self.destination,
+                reason=reason,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+            if self.bytes_submitted_to_socket:
+                self.stream_error = exc
+            raise LiveRelayError(safe_error(exc)) from exc
+
+    async def close(self, reason: str) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        clean_response_idle = False
+        try:
+            if self.printer_writer is not None:
+                with contextlib.suppress(LiveRelayError):
+                    await self.half_close_printer(reason)
+                clean_response_idle = await self._wait_for_response_tail()
+                self.printer_writer.close()
+                with contextlib.suppress(Exception):
+                    await self.printer_writer.wait_closed()
+                if self.printer_close_kind is None:
+                    self.printer_close_kind = "local_close"
+            if self.response_task is not None and not self.response_task.done():
+                if not clean_response_idle and self.stream_error is None:
+                    self.stream_error = TimeoutError(
+                        "printer response relay was cancelled before completion"
+                    )
+                if not clean_response_idle:
+                    self.failure_event.set()
+                self.response_task.cancel()
+                await asyncio.gather(self.response_task, return_exceptions=True)
+            if (
+                self._job_bytes_submitted_to_client != self._job_response_bytes
+                and self.stream_error is None
+            ):
+                self.stream_error = LiveRelayError(
+                    "printer response bytes were not fully drained to the client"
+                )
+                self.failure_event.set()
+        finally:
+            self._release_lock()
+            log_event(
+                logging.INFO,
+                "PRINTER_SESSION_CLOSED",
+                timestamp=utc_now(),
+                session_id=self.session_id,
+                reason=reason,
+                bytes_client_to_printer=self.bytes_client_to_printer,
+                bytes_printer_to_client=self.bytes_printer_to_client,
+                printer_fin=self.printer_fin_received,
+                printer_rst=self.printer_reset_received,
+                error=safe_error(self.stream_error) if self.stream_error else "none",
+            )
+
+    def _release_lock(self) -> None:
+        if self.lock_acquired:
+            self.lock_acquired = False
+            self.service.printer_session_lock.release()
 
 
 class DurableScheduler:
@@ -166,6 +668,10 @@ class PrintProxyService:
         self.store = StateStore(settings)
         self.ledger = IntegrityLedger(settings, self.key)
         self.scheduler = DurableScheduler(settings.preserve_queue_order)
+        # A RAW printer stream is a session, not a datagram. Holding one lock
+        # for the whole accepted client session prevents cross-client byte
+        # interleaving and ambiguous reverse-channel routing.
+        self.printer_session_lock = asyncio.Lock()
         self.shutdown_event = asyncio.Event()
         self.sidecar_semaphore = asyncio.Semaphore(settings.max_concurrent_sidecars)
         self.active_client_slots = 0
@@ -232,6 +738,25 @@ class PrintProxyService:
             "attempt_id": state.get("attempt_id"),
             "error": state.get("last_error"),
             "operator_action": state.get("operator_action"),
+            "state_schema_version": state.get("schema_version"),
+            "delivery_mode": self.settings.delivery_mode,
+            "clean_filename": state.get("clean_filename"),
+            "clean_sha256": state.get("clean_sha256"),
+            "pdf_filename": state.get("pdf_filename"),
+            "pdf_sha256": state.get("pdf_sha256"),
+            "render_status": state.get("render_status"),
+            "bytes_client_to_printer": state.get("bytes_client_to_printer"),
+            "bytes_printer_received": state.get("bytes_printer_received"),
+            "bytes_printer_to_client": state.get("bytes_printer_to_client"),
+            "realtime_status_queries": state.get("realtime_status_queries"),
+            "parsed_realtime_status_queries": state.get(
+                "parsed_realtime_status_queries"
+            ),
+            "printer_response_sha256": state.get("printer_response_sha256"),
+            "printer_response_delivered_sha256": state.get(
+                "printer_response_delivered_sha256"
+            ),
+            "retry_allowed": state.get("retry_allowed"),
         }
 
     def _outbox_auth(
@@ -255,6 +780,8 @@ class PrintProxyService:
     ) -> None:
         event_status = {
             "ARCHIVED": "SEALED",
+            "DUPLEX_ACTIVE": "DUPLEX_ACTIVE",
+            "DUPLEX_ABORTED": "DUPLEX_ABORTED",
             "QUEUED": "QUEUED",
             "PARTIAL_ARCHIVED": "PARTIAL",
             "SEND_ARMED": "SEND_ARMED",
@@ -272,7 +799,9 @@ class PrintProxyService:
         if event not in event_status or event_status[event] != status:
             raise IntegrityError(f"invalid ledger transition event/status: {event}/{status}")
         predecessors: dict[str, set[str | None]] = {
-            "ARCHIVED": {None},
+            "ARCHIVED": {None, "DUPLEX_ACTIVE"},
+            "DUPLEX_ACTIVE": {None},
+            "DUPLEX_ABORTED": {"ARCHIVED"},
             "QUEUED": {"ARCHIVED"},
             "PARTIAL_ARCHIVED": {"ARCHIVED"},
             "SEND_ARMED": {
@@ -282,11 +811,11 @@ class PrintProxyService:
                 "FAILED_BEFORE_SEND_RECOVERY",
             },
             "SENDING": {"SEND_ARMED"},
-            "SENT_UNCONFIRMED": {"SENDING"},
-            "FAILED_BEFORE_SEND": {"SEND_ARMED"},
+            "SENT_UNCONFIRMED": {"SENDING", "ARCHIVED"},
+            "FAILED_BEFORE_SEND": {"SEND_ARMED", "ARCHIVED"},
             "FAILED_BEFORE_SEND_RECOVERY": {"SEND_ARMED"},
-            "UNKNOWN_PRINT_STATE": {"SENDING"},
-            "UNKNOWN_PRINT_STATE_RECOVERY": {"SENDING"},
+            "UNKNOWN_PRINT_STATE": {"SENDING", "ARCHIVED", "SENT_UNCONFIRMED"},
+            "UNKNOWN_PRINT_STATE_RECOVERY": {"SENDING", "ARCHIVED"},
             "MANUAL_RETRY_QUEUED": {
                 "QUEUED",
                 "MANUAL_RETRY_QUEUED",
@@ -439,7 +968,7 @@ class PrintProxyService:
         base = f"{filename_timestamp(timestamp_start)}_{job_id}"
         raw_filename = f"{base}.raw"
         state: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": STATE_SCHEMA_VERSION,
             "job_id": job_id,
             "session_id": session_id,
             "state": "RECEIVING",
@@ -457,6 +986,7 @@ class PrintProxyService:
             "bytes_received": 0,
             "bytes_archived": 0,
             "bytes_forwarded": 0,
+            "bytes_submitted_to_socket": 0,
             "raw_filename": raw_filename,
             "metadata_filename": f"{base}.json",
             "readable_filename": f"{base}.txt" if self.settings.enable_readable_dump else None,
@@ -480,6 +1010,38 @@ class PrintProxyService:
             "sidecar_errors": [],
             "monotonic_start_hint": monotonic_start,
         }
+        state.update(
+            {
+                "bytes_client_to_printer": 0,
+                "bytes_printer_to_client": 0,
+                "bytes_printer_received": 0,
+                "bytes_submitted_to_client": 0,
+                "printer_response_hex": "",
+                "printer_response_truncated": False,
+                "printer_response_sha256": hashlib.sha256(b"").hexdigest(),
+                "printer_response_delivered_sha256": hashlib.sha256(b"").hexdigest(),
+                "realtime_status_queries": 0,
+                "parsed_realtime_status_queries": 0,
+                "client_fin_received": False,
+                "printer_fin_received": False,
+                "client_close_kind": None,
+                "printer_close_kind": None,
+                "full_duplex": self.settings.full_duplex,
+                "retry_allowed": not self.settings.full_duplex,
+                "clean_filename": (
+                    f"{base}.PULITO.txt" if self.settings.save_clean_text else None
+                ),
+                "pdf_filename": f"{base}.pdf" if self.settings.save_pdf else None,
+                "clean_sha256": None,
+                "pdf_sha256": None,
+                "render_status": (
+                    "pending"
+                    if self.settings.save_clean_text or self.settings.save_pdf
+                    else "disabled"
+                ),
+                "render_completed_at": None,
+            }
+        )
         temporary = self.settings.receiving_dir / f"{job_id}.raw.tmp"
         state["receiving_filename"] = temporary.name
         return state, temporary
@@ -520,9 +1082,40 @@ class PrintProxyService:
         return total
 
     async def _read_with_timeout(
-        self, reader: asyncio.StreamReader, timeout: float
+        self,
+        reader: asyncio.StreamReader,
+        timeout: float,
+        relay: LivePrinterRelay | None = None,
     ) -> bytes:
-        return await asyncio.wait_for(reader.read(self.settings.chunk_size), timeout=timeout)
+        if relay is None:
+            return await asyncio.wait_for(reader.read(self.settings.chunk_size), timeout=timeout)
+        read_task = asyncio.create_task(reader.read(self.settings.chunk_size))
+        failure_task = asyncio.create_task(relay.failure_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {read_task, failure_task},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise asyncio.TimeoutError
+            if read_task in done:
+                data = read_task.result()
+                if data:
+                    # Preserve bytes already removed from StreamReader even if
+                    # reverse failure won the same event-loop turn. The caller
+                    # archives them; relay.send then fails without forwarding.
+                    return data
+            if failure_task in done and relay.failure_event.is_set():
+                raise LiveRelayError(
+                    safe_error(relay.stream_error or RuntimeError("reverse relay failed"))
+                )
+            return read_task.result()
+        finally:
+            for task in (read_task, failure_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(read_task, failure_task, return_exceptions=True)
 
     async def _receive_one(
         self,
@@ -532,6 +1125,8 @@ class PrintProxyService:
         source_ip: str,
         source_port: int,
         first_byte_timeout: float,
+        relay: LivePrinterRelay | None = None,
+        session_deadline: float | None = None,
     ) -> ReceiveResult | None:
         try:
             spool_free = disk_free_mb(self.settings.spool_dir)
@@ -552,7 +1147,7 @@ class PrintProxyService:
             pending.clear()
         else:
             try:
-                first = await self._read_with_timeout(reader, first_byte_timeout)
+                first = await self._read_with_timeout(reader, first_byte_timeout, relay)
             except asyncio.TimeoutError:
                 return None
         if not first:
@@ -562,6 +1157,8 @@ class PrintProxyService:
         state, temporary = self._new_receiving_state(
             session_id, source_ip, source_port, monotonic_start
         )
+        if relay is not None:
+            relay.begin_job(state)
         try:
             fd = self._open_receiving_file(temporary)
         except OSError as exc:
@@ -587,17 +1184,17 @@ class PrintProxyService:
         current = first
         storage_failed = False
 
-        def commit_bytes(data: bytes) -> None:
+        async def commit_bytes(data: bytes) -> None:
             nonlocal bytes_since_sync
             if not data:
                 return
             state["bytes_received"] += len(data)
             state["timestamp_last_byte"] = utc_now()
-            written = self._write_receiving(fd, data)
+            written = await durable_to_thread(self._write_receiving, fd, data)
             state["bytes_archived"] += written
             bytes_since_sync += written
             if bytes_since_sync >= self.settings.fsync_interval_bytes:
-                os.fsync(fd)
+                await durable_to_thread(os.fsync, fd)
                 bytes_since_sync = 0
 
         try:
@@ -607,7 +1204,7 @@ class PrintProxyService:
                     match = find_escpos_cut(bytes(scan_buffer))
                     if match is not None:
                         _, end = match
-                        commit_bytes(bytes(scan_buffer[:end]))
+                        await commit_bytes(bytes(scan_buffer[:end]))
                         pending.extend(scan_buffer[end:])
                         scan_buffer.clear()
                         complete = True
@@ -615,10 +1212,20 @@ class PrintProxyService:
                         break
                     flush_length = max(0, len(scan_buffer) - 3)
                     if flush_length:
-                        commit_bytes(bytes(scan_buffer[:flush_length]))
+                        await commit_bytes(bytes(scan_buffer[:flush_length]))
                         del scan_buffer[:flush_length]
                 else:
-                    commit_bytes(current)
+                    await commit_bytes(current)
+
+                if relay is not None:
+                    # Every byte is on stable storage before it can enter the
+                    # printer kernel send buffer. Offloading fsync keeps the
+                    # reverse relay schedulable while storage is slow.
+                    if bytes_since_sync:
+                        await durable_to_thread(os.fsync, fd)
+                        bytes_since_sync = 0
+                    if not await relay.send(state, current):
+                        raise LiveRelayError("printer connection failed before send")
 
                 if state["bytes_received"] > self.settings.max_job_bytes:
                     boundary_reason = "max_job_bytes_exceeded"
@@ -630,46 +1237,94 @@ class PrintProxyService:
                 remaining = self.settings.max_job_duration - elapsed
                 timeout = remaining
                 timeout_reason = "max_job_duration"
+                if session_deadline is not None:
+                    session_remaining = session_deadline - time.monotonic()
+                    if session_remaining <= 0:
+                        boundary_reason = "max_session_duration_exceeded"
+                        break
+                    if session_remaining < timeout:
+                        timeout = session_remaining
+                        timeout_reason = "max_session_duration"
                 if self.settings.job_end_mode in {"idle_timeout", "hybrid"}:
                     # Keep the winning deadline explicit. Inferring it from the
                     # numeric timeout misclassifies MAX_JOB_DURATION as a clean
                     # idle boundary whenever remaining < IDLE_TIMEOUT.
-                    if self.settings.idle_timeout < remaining:
+                    if self.settings.idle_timeout < timeout:
                         timeout = self.settings.idle_timeout
                         timeout_reason = "idle"
                 try:
-                    current = await self._read_with_timeout(reader, timeout)
+                    current = await self._read_with_timeout(reader, timeout, relay)
                 except asyncio.TimeoutError:
                     if timeout_reason == "idle":
                         if scan_buffer:
-                            commit_bytes(bytes(scan_buffer))
+                            await commit_bytes(bytes(scan_buffer))
                             scan_buffer.clear()
                         complete = True
                         idle_triggered = True
                         boundary_reason = "idle_timeout"
                     else:
-                        boundary_reason = "max_job_duration_exceeded"
+                        boundary_reason = (
+                            "max_session_duration_exceeded"
+                            if timeout_reason == "max_session_duration"
+                            else "max_job_duration_exceeded"
+                        )
                     break
                 if not current:
                     if scan_buffer:
-                        commit_bytes(bytes(scan_buffer))
+                        await commit_bytes(bytes(scan_buffer))
                         scan_buffer.clear()
                     complete = True
                     connection_closed = True
+                    state["client_fin_received"] = True
+                    state["client_close_kind"] = "fin"
                     boundary_reason = "connection_close"
+                    log_event(
+                        logging.INFO,
+                        "TCP_FIN",
+                        timestamp=utc_now(),
+                        session_id=session_id,
+                        direction="CLIENT_TO_PRINTER",
+                        source=f"{source_ip}:{source_port}",
+                        destination=f"{self.settings.printer_ip}:{self.settings.printer_port}",
+                    )
+                    if relay is not None:
+                        await relay.half_close_printer("client_fin")
                     break
+        except LiveRelayError as exc:
+            if scan_buffer:
+                with contextlib.suppress(OSError):
+                    await commit_bytes(bytes(scan_buffer))
+            boundary_reason = (
+                "printer_connect_error"
+                if relay is not None and relay.connect_error is not None and state.get("attempt_id") is None
+                else "printer_stream_error"
+            )
+            state["last_error"] = safe_error(exc)
+            state["forward_status"] = "live_send_unknown"
         except (ConnectionResetError, BrokenPipeError) as exc:
             if scan_buffer:
                 with contextlib.suppress(OSError):
-                    commit_bytes(bytes(scan_buffer))
+                    await commit_bytes(bytes(scan_buffer))
             boundary_reason = "client_reset"
             state["last_error"] = safe_error(exc)
+            state["client_close_kind"] = "rst"
+            log_event(
+                logging.WARNING,
+                "TCP_RST",
+                timestamp=utc_now(),
+                session_id=session_id,
+                direction="CLIENT_TO_PRINTER",
+                source=f"{source_ip}:{source_port}",
+                destination=f"{self.settings.printer_ip}:{self.settings.printer_port}",
+                error=safe_error(exc),
+            )
         except asyncio.CancelledError:
             if scan_buffer:
                 with contextlib.suppress(OSError):
-                    commit_bytes(bytes(scan_buffer))
+                    await commit_bytes(bytes(scan_buffer))
             boundary_reason = "service_shutdown"
             cancelled = True
+            state["client_close_kind"] = "service_shutdown"
         except OSError as exc:
             storage_failed = True
             boundary_reason = "storage_error"
@@ -679,7 +1334,7 @@ class PrintProxyService:
                 log_event(logging.CRITICAL, "DISK_SPACE_LOW", job_id=state["job_id"], error=safe_error(exc))
         finally:
             try:
-                os.fsync(fd)
+                await durable_to_thread(os.fsync, fd)
             except OSError as exc:
                 storage_failed = True
                 complete = False
@@ -697,12 +1352,30 @@ class PrintProxyService:
         state["boundary_reason"] = boundary_reason
         state["complete_by_policy"] = complete
         state["idle_timeout_triggered"] = idle_triggered
-        state["state"] = "SEALED"
-        state["forward_status"] = "sealed_not_yet_archived"
-        try:
-            self.store.write(state)
-        except OSError as exc:
-            raise StorageError(f"cannot persist sealed receive state: {safe_error(exc)}") from exc
+        if relay is not None:
+            relay.snapshot_job(state)
+            if state.get("attempt_id") is not None:
+                # Keep the authenticated DUPLEX_ACTIVE state durable until
+                # ARCHIVED replaces it. Persisting a mutable SEALED snapshot
+                # here would create a crash window inconsistent with the
+                # latest HMAC ledger event.
+                state["state"] = "DUPLEX_ACTIVE"
+                state["forward_status"] = (
+                    "live_sealed_send_unconfirmed"
+                    if state.get("last_error") is None
+                    else "live_sealed_send_unknown"
+                )
+            else:
+                state["state"] = "SEALED"
+                state["forward_status"] = "live_sealed_failed_before_send_no_auto_retry"
+        else:
+            state["state"] = "SEALED"
+            state["forward_status"] = "sealed_not_yet_archived"
+        if state["state"] != "DUPLEX_ACTIVE":
+            try:
+                self.store.write(state)
+            except OSError as exc:
+                raise StorageError(f"cannot persist sealed receive state: {safe_error(exc)}") from exc
         return ReceiveResult(
             state=state,
             temp_path=temporary,
@@ -715,6 +1388,10 @@ class PrintProxyService:
 
     async def _seal_result(self, result: ReceiveResult) -> dict[str, Any]:
         state = result.state
+        live_job = (
+            state.get("schema_version") == STATE_SCHEMA_VERSION
+            and state.get("full_duplex") is True
+        )
         raw_path = self._raw_path(state)
         if result.temp_path.exists():
             durable_move(result.temp_path, raw_path)
@@ -746,7 +1423,8 @@ class PrintProxyService:
         state["idle_timeout_triggered"] = result.idle_timeout_triggered
         state["timestamp_archive_complete"] = utc_now()
         state["state"] = "SEALED"
-        state["forward_status"] = "sealed_archived"
+        if not live_job:
+            state["forward_status"] = "sealed_archived"
         sidecar_errors: list[str] = []
         if self.settings.enable_readable_dump and state.get("readable_filename"):
             try:
@@ -770,6 +1448,8 @@ class PrintProxyService:
                     )
             except Exception as exc:
                 sidecar_errors.append("hex: " + safe_error(exc))
+        if state.get("schema_version") == STATE_SCHEMA_VERSION:
+            await self._render_receipt_sidecars(state, raw_path, sidecar_errors)
         state["sidecar_errors"] = sidecar_errors
         if state.get("last_committed_event") != "ARCHIVED":
             archive_event = self._persist_state_event(state, "ARCHIVED")
@@ -785,7 +1465,70 @@ class PrintProxyService:
         ):
             raise IntegrityError("ARCHIVED record lacks a valid queue sequence")
         state["queue_sequence"] = archive_sequence
-        if result.complete:
+        if live_job:
+            possible_send = state.get("attempt_id") is not None
+            sent_exact = (
+                int(state.get("bytes_forwarded", 0)) == raw_size
+                and int(state.get("bytes_submitted_to_socket", 0)) >= raw_size
+            )
+            crashed = result.boundary_reason.startswith("crash_") or (
+                state.get("recovered_after_crash") is True and possible_send
+            )
+            if possible_send and result.complete and sent_exact and not crashed and state.get("last_error") is None:
+                state["state"] = "SENT_UNCONFIRMED"
+                state["forward_status"] = "tcp_full_duplex_forwarded_physical_unconfirmed"
+                state["physical_print_confirmed"] = False
+                state["timestamp_forward_complete"] = utc_now()
+                state["forward_duration_ms"] = state.get("connection_duration_ms")
+                self._persist_state_event(state, "SENT_UNCONFIRMED")
+                level = logging.INFO
+            elif possible_send:
+                state["state"] = "UNKNOWN_PRINT_STATE"
+                state["forward_status"] = "live_send_unknown_no_auto_retry"
+                state["physical_print_confirmed"] = False
+                state["next_retry_at"] = None
+                state["next_retry_epoch"] = None
+                if state.get("last_error") is None:
+                    state["last_error"] = (
+                        "service restart after live send"
+                        if crashed
+                        else f"live delivery incomplete: {result.boundary_reason}"
+                    )
+                self._persist_state_event(
+                    state,
+                    "UNKNOWN_PRINT_STATE_RECOVERY" if crashed else "UNKNOWN_PRINT_STATE",
+                )
+                level = logging.CRITICAL
+            else:
+                # A live client may retry as soon as it observes failure. Raw
+                # ESC/POS with DLE queries is not a replayable one-way job, so
+                # pre-send failures use a terminal duplex-specific state.
+                state["state"] = "DUPLEX_ABORTED"
+                state["forward_status"] = "duplex_aborted_before_send_no_retry"
+                state["physical_print_confirmed"] = False
+                state["retry_allowed"] = False
+                state["next_retry_at"] = None
+                state["next_retry_epoch"] = None
+                if state.get("last_error") is None:
+                    state["last_error"] = "printer connection unavailable"
+                self._persist_state_event(state, "DUPLEX_ABORTED")
+                level = logging.ERROR
+            log_event(
+                level,
+                "LIVE_JOB_FINALIZED",
+                timestamp=utc_now(),
+                job_id=state["job_id"],
+                session_id=state["session_id"],
+                source=f"{state['source_ip']}:{state['source_port']}",
+                destination=f"{self.settings.printer_ip}:{self.settings.printer_port}",
+                status=state["state"],
+                boundary=result.boundary_reason,
+                bytes_client_to_printer=state.get("bytes_client_to_printer", 0),
+                bytes_printer_to_client=state.get("bytes_printer_to_client", 0),
+                realtime_status_queries=state.get("realtime_status_queries", 0),
+                duration=f"{state['connection_duration_ms']}ms",
+            )
+        elif result.complete:
             state["state"] = "QUEUED"
             state["forward_status"] = "queued"
             self._persist_state_event(state, "QUEUED")
@@ -817,6 +1560,116 @@ class PrintProxyService:
             )
         return state
 
+    async def _render_receipt_sidecars(
+        self, state: dict[str, Any], raw_path: Path, sidecar_errors: list[str]
+    ) -> None:
+        """Render bounded human/PDF copies after the live TCP session is done.
+
+        RAW is already durable and authoritative.  Rendering runs in a bounded
+        worker thread and failures are recorded without changing delivery state.
+        """
+
+        clean_path = (
+            self._sidecar_path(state, "clean_filename", ".PULITO.txt")
+            if self.settings.save_clean_text and state.get("clean_filename")
+            else None
+        )
+        pdf_path = (
+            self._sidecar_path(state, "pdf_filename", ".pdf")
+            if self.settings.save_pdf and state.get("pdf_filename")
+            else None
+        )
+        if clean_path is None and pdf_path is None:
+            state["render_status"] = "disabled"
+            state["render_completed_at"] = utc_now()
+            return
+
+        try:
+            prefix, truncated = await asyncio.to_thread(
+                read_regular_file_prefix,
+                raw_path,
+                max_bytes=self.settings.max_readable_dump_bytes,
+            )
+            # One sentinel beyond the parser limit records that the source was
+            # larger without altering any parsed input byte.
+            render_input = prefix + (b"\x00" if truncated else b"")
+            limits = ParseLimits(max_input_bytes=self.settings.max_readable_dump_bytes)
+            async with self.sidecar_semaphore:
+                rendered = await asyncio.to_thread(
+                    render_receipt_artifacts,
+                    render_input,
+                    clean_text_path=clean_path,
+                    pdf_path=pdf_path,
+                    default_codepage=self.settings.default_codepage,
+                    limits=limits,
+                    pdf_width_mm=self.settings.pdf_width_mm,
+                    best_effort=True,
+                )
+            succeeded = 0
+            expected = int(clean_path is not None) + int(pdf_path is not None)
+            if clean_path is not None:
+                if rendered.clean_text_error is None and clean_path.is_file():
+                    state["clean_sha256"] = (await asyncio.to_thread(sha256_file, clean_path))[0]
+                    succeeded += 1
+                else:
+                    sidecar_errors.append(
+                        "clean receipt: "
+                        + (rendered.clean_text_error or "artifact was not created")
+                    )
+            if pdf_path is not None:
+                if rendered.pdf is not None and rendered.pdf.success and pdf_path.is_file():
+                    state["pdf_sha256"] = (await asyncio.to_thread(sha256_file, pdf_path))[0]
+                    succeeded += 1
+                else:
+                    sidecar_errors.append(
+                        "receipt PDF: "
+                        + (
+                            rendered.pdf.error
+                            if rendered.pdf is not None and rendered.pdf.error
+                            else "artifact was not created"
+                        )
+                    )
+            state["render_status"] = (
+                "complete" if succeeded == expected else "partial" if succeeded else "failed"
+            )
+            state["parsed_realtime_status_queries"] = sum(
+                isinstance(node, RealtimeStatusBlock) for node in rendered.document.nodes
+            )
+            if rendered.document.truncated:
+                sidecar_errors.append(
+                    "receipt rendering input was bounded; authoritative RAW is complete"
+                )
+        except Exception as exc:
+            state["render_status"] = "failed"
+            sidecar_errors.append("receipt rendering: " + safe_error(exc))
+        finally:
+            state["render_completed_at"] = utc_now()
+
+    def _mark_finalized_live_job_unknown(
+        self, job_id: str, error: BaseException
+    ) -> None:
+        with self.store.locked(job_id):
+            state = self.store.load(job_id)
+            if state.get("state") == "UNKNOWN_PRINT_STATE":
+                return
+            if state.get("state") != "SENT_UNCONFIRMED" or state.get("full_duplex") is not True:
+                return
+            self._validate_operational_state(state)
+            state["state"] = "UNKNOWN_PRINT_STATE"
+            state["forward_status"] = "live_reverse_channel_failed_no_retry"
+            state["last_error"] = safe_error(error)
+            state["retry_allowed"] = False
+            state["next_retry_at"] = None
+            state["next_retry_epoch"] = None
+            self._persist_state_event(state, "UNKNOWN_PRINT_STATE")
+        log_event(
+            logging.CRITICAL,
+            "LIVE_JOB_BECAME_UNKNOWN",
+            timestamp=utc_now(),
+            job_id=job_id,
+            error=safe_error(error),
+        )
+
     def _force_reset(self, writer: asyncio.StreamWriter) -> None:
         raw_socket = writer.get_extra_info("socket")
         if raw_socket is not None:
@@ -824,6 +1677,125 @@ class PrintProxyService:
                 raw_socket.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if not self.settings.full_duplex:
+            await self._handle_store_forward_client(reader, writer)
+            return
+        task = asyncio.current_task()
+        if task is not None:
+            self.client_tasks.add(task)
+        peer = writer.get_extra_info("peername") or ("unknown", 0)
+        source_ip, source_port = str(peer[0]), int(peer[1])
+        source = f"{source_ip}:{source_port}"
+        session_id = str(uuid.uuid4())
+        pending = bytearray()
+        results: list[ReceiveResult] = []
+        relay: LivePrinterRelay | None = None
+        slot_acquired = False
+        session_started = time.monotonic()
+        reset_client = False
+        try:
+            if not self.settings.client_allowed(source_ip):
+                log_event(logging.WARNING, "CLIENT_REJECTED", source=source_ip, reason="ACL")
+                self._force_reset(writer)
+                return
+            if self.active_client_slots >= self.settings.max_concurrent_clients:
+                log_event(logging.WARNING, "CLIENT_REJECTED", source=source_ip, reason="CONCURRENCY_LIMIT")
+                self._force_reset(writer)
+                return
+            self.active_client_slots += 1
+            slot_acquired = True
+            relay = LivePrinterRelay(self, writer, session_id, source)
+            # Transparent TCP semantics include server-first bytes: upstream is
+            # connected before consuming anything from the client.
+            if not await relay.open():
+                self._force_reset(writer)
+                reset_client = True
+                return
+            log_event(logging.INFO, "DUPLEX_SESSION_ACCEPTED", session_id=session_id, source=source)
+            segment_count = 0
+            while not self.shutdown_event.is_set():
+                remaining_session = self.settings.max_session_duration - (
+                    time.monotonic() - session_started
+                )
+                if remaining_session <= 0:
+                    reset_client = True
+                    log_event(
+                        logging.WARNING,
+                        "TCP_TIMEOUT",
+                        session_id=session_id,
+                        direction="CLIENT_TO_PRINTER",
+                        reason="max_session_duration",
+                    )
+                    break
+                first_timeout = (
+                    self.settings.initial_data_timeout
+                    if segment_count == 0
+                    else self.settings.session_idle_timeout
+                )
+                result = await self._receive_one(
+                    reader,
+                    pending,
+                    session_id,
+                    source_ip,
+                    source_port,
+                    min(first_timeout, remaining_session),
+                    relay,
+                    session_started + self.settings.max_session_duration,
+                )
+                if result is None:
+                    break
+                results.append(result)
+                segment_count += 1
+                if not result.complete or result.connection_closed or result.cancelled:
+                    reset_client = not result.complete
+                    break
+                # An idle boundary seals only the archive segment. The same
+                # upstream socket remains live for the next segment.
+        except asyncio.CancelledError:
+            raise
+        except (StorageError, IntegrityError) as exc:
+            reset_client = True
+            log_event(logging.CRITICAL, "JOB_FAILED", session_id=session_id, error=safe_error(exc))
+            self.request_fatal_shutdown(exc)
+        except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+            reset_client = True
+            log_event(logging.WARNING, "CLIENT_CONNECTION_ERROR", session_id=session_id, error=safe_error(exc))
+        finally:
+            if relay is not None:
+                with contextlib.suppress(Exception):
+                    await relay.close("client_session_end")
+                if results:
+                    relay.snapshot_job(results[-1].state)
+                for result in results:
+                    result.state["printer_fin_received"] = relay.printer_fin_received
+                    result.state["printer_close_kind"] = relay.printer_close_kind
+                    if relay.stream_error is not None and result.state.get("attempt_id") is not None:
+                        result.state["last_error"] = safe_error(relay.stream_error)
+                    try:
+                        await self._seal_result(result)
+                    except Exception as exc:
+                        reset_client = True
+                        log_event(
+                            logging.CRITICAL,
+                            "JOB_FAILED",
+                            job_id=result.state.get("job_id"),
+                            error=safe_error(exc),
+                        )
+                        self.request_fatal_shutdown(exc)
+                        break
+            if slot_acquired:
+                self.active_client_slots -= 1
+            if reset_client:
+                self._force_reset(writer)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            if task is not None:
+                self.client_tasks.discard(task)
+
+    async def _handle_store_forward_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
         task = asyncio.current_task()
         if task is not None:
             self.client_tasks.add(task)
@@ -1100,9 +2072,19 @@ class PrintProxyService:
         attempt_armed = False
         forward_started = time.monotonic()
         state: dict[str, Any]
+        await self.printer_session_lock.acquire()
         try:
             with self.store.locked(job_id):
                 state = self.store.load(job_id)
+                if state.get("retry_allowed") is False:
+                    self._validate_operational_state(state)
+                    log_event(
+                        logging.ERROR,
+                        "RETRY_BLOCKED",
+                        job_id=job_id,
+                        reason="duplex_job_not_replayable",
+                    )
+                    return
                 if state.get("state") not in SAFE_RETRY_STATES:
                     self._validate_operational_state(state)
                     return
@@ -1219,6 +2201,7 @@ class PrintProxyService:
                 writer.close()
                 with contextlib.suppress(Exception):
                     await writer.wait_closed()
+            self.printer_session_lock.release()
 
     def _unknown_jobs_exist(self) -> bool:
         return any(state.get("state") == "UNKNOWN_PRINT_STATE" for state in self.store.list())
@@ -1276,6 +2259,8 @@ class PrintProxyService:
                     consume_request = True
                     return
                 previous = state.get("state")
+                if state.get("retry_allowed") is False:
+                    raise StorageError("duplex jobs are not replayable")
                 if previous == "UNKNOWN_PRINT_STATE" and not confirmed_unknown:
                     raise StorageError("unknown print state retry lacks explicit confirmation")
                 if previous not in {"FAILED_BEFORE_SEND", "QUEUED", "UNKNOWN_PRINT_STATE"}:
@@ -1389,7 +2374,9 @@ class PrintProxyService:
             except asyncio.TimeoutError:
                 pass
 
-    def _retention_paths(self, state: dict[str, Any]) -> tuple[Path, Path, Path, Path]:
+    def _retention_paths(
+        self, state: dict[str, Any]
+    ) -> tuple[Path, Path, Path, Path, Path, Path]:
         archive = self.ledger.archive_record(state["job_id"])
         if archive is None or (
             archive.get("raw_filename") != state.get("raw_filename")
@@ -1402,6 +2389,8 @@ class PrintProxyService:
             raw_path,
             raw_path.with_suffix(".txt"),
             raw_path.with_suffix(".hex"),
+            raw_path.with_suffix(".PULITO.txt"),
+            raw_path.with_suffix(".pdf"),
             self._metadata_path(state),
         )
 
@@ -1410,8 +2399,10 @@ class PrintProxyService:
         # Authorization must precede the first unlink. In particular, a mutable
         # state bit-flipped to RETENTION_DELETED is not a tombstone.
         self._validate_recovery_state(state)
-        raw_path, text_path, hex_path, metadata_path = self._retention_paths(state)
-        for artifact_path in (raw_path, text_path, hex_path):
+        raw_path, text_path, hex_path, clean_path, pdf_path, metadata_path = (
+            self._retention_paths(state)
+        )
+        for artifact_path in (raw_path, text_path, hex_path, clean_path, pdf_path):
             with contextlib.suppress(FileNotFoundError):
                 artifact_path.unlink()
         fsync_directory(self.settings.data_dir)
@@ -1436,6 +2427,10 @@ class PrintProxyService:
         temporary = self.settings.receiving_dir / temp_name
         raw_path = self._raw_path(state)
         if not temporary.exists() and not raw_path.exists():
+            if state.get("state") == "DUPLEX_ACTIVE":
+                raise IntegrityError(
+                    "authenticated DUPLEX_ACTIVE job has no recoverable RAW evidence"
+                )
             state["state"] = "QUARANTINED"
             state["last_error"] = "crash recovery found no RAW"
             self._persist_state_event(state, "QUARANTINED")
@@ -1548,6 +2543,8 @@ class PrintProxyService:
                 self._validate_recovery_state(state)
                 if current == "RECEIVING":
                     await self._recover_receiving(state)
+                elif current == "DUPLEX_ACTIVE":
+                    await self._recover_receiving(state)
                 elif current == "SEALED":
                     await self._recover_sealed(state)
                 elif current in {"RETENTION_DELETING", "RETENTION_DELETED"}:
@@ -1592,7 +2589,7 @@ class PrintProxyService:
                 # and fail startup for operator-led recovery.
                 if isinstance(exc, IntegrityError):
                     raise
-                if current in {"RECEIVING", "SEALED"}:
+                if current in {"RECEIVING", "SEALED", "DUPLEX_ACTIVE"}:
                     raise
                 if isinstance(state, dict) and state.get("pending_ledger_event") is not None:
                     raise
@@ -1600,6 +2597,30 @@ class PrintProxyService:
                 state["last_error"] = "recovery: " + safe_error(exc)
                 self._persist_state_event(state, "QUARANTINED")
         await self._recover_orphan_temps({str(value) for value in known_ids})
+        if self.settings.full_duplex:
+            backlog = [
+                state
+                for state in self.store.list()
+                if (
+                    state.get("state")
+                    in {"QUEUED", "FAILED_BEFORE_SEND", "SEND_ARMED", "SENDING"}
+                    and state.get("retry_allowed") is not False
+                )
+                or (
+                    self.settings.block_queue_on_unknown
+                    and state.get("state") == "UNKNOWN_PRINT_STATE"
+                )
+            ]
+            if backlog:
+                summary = ", ".join(
+                    f"{state.get('job_id')}:{state.get('state')}" for state in backlog[:10]
+                )
+                raise StorageError(
+                    "transparent_duplex cannot start with blocked legacy backlog or "
+                    "UNKNOWN print state; drain replayable jobs temporarily with "
+                    "DELIVERY_MODE=store_forward, or resolve the UNKNOWN policy: "
+                    + summary
+                )
 
     def request_shutdown(self) -> None:
         if not self.shutdown_event.is_set():
@@ -1654,9 +2675,12 @@ class PrintProxyService:
         for bound in sockets:
             log_event(logging.INFO, "SERVICE_START", listener=bound.getsockname(), pid=os.getpid())
         self.background_tasks = [
-            asyncio.create_task(self._forward_worker(), name="printer-forwarder"),
             asyncio.create_task(self._request_worker(), name="request-worker"),
         ]
+        if not self.settings.full_duplex:
+            self.background_tasks.append(
+                asyncio.create_task(self._forward_worker(), name="printer-forwarder")
+            )
         if self.settings.enable_retention:
             self.background_tasks.append(
                 asyncio.create_task(self._retention_worker(), name="retention-worker")

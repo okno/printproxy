@@ -37,6 +37,32 @@ class HashAndLedgerTests(unittest.TestCase):
         self.assertEqual(digest, hashlib.sha256(b"abc").hexdigest())
         self.assertEqual(size, 3)
 
+    def test_v1_metadata_schema_stays_byte_compatible_after_duplex_upgrade(self) -> None:
+        legacy = {
+            "schema_version": 1,
+            "job_id": "00000000-0000-4000-8000-000000000099",
+            "state": "SENT_UNCONFIRMED",
+            "raw_filename": "legacy.raw",
+            "readable_filename": "legacy.txt",
+            "raw_sha256": "a" * 64,
+            # These v2-only values must never be injected into a v1 document;
+            # doing so would invalidate historical metadata HMACs on upgrade.
+            "bytes_printer_to_client": 1,
+            "clean_filename": "legacy.PULITO.txt",
+            "pdf_filename": "legacy.pdf",
+        }
+        document = metadata_document_from_state(legacy)
+        self.assertEqual(document["schema_version"], 1)
+        self.assertNotIn("bytes_printer_to_client", document)
+        self.assertNotIn("clean_filename", document)
+        self.assertNotIn("pdf_filename", document)
+
+        current = dict(legacy, schema_version=2)
+        current_document = metadata_document_from_state(current)
+        self.assertEqual(current_document["bytes_printer_to_client"], 1)
+        self.assertEqual(current_document["clean_filename"], "legacy.PULITO.txt")
+        self.assertEqual(current_document["pdf_filename"], "legacy.pdf")
+
     def test_chain_hmac_and_file_tamper_detection(self) -> None:
         key = load_hmac_key(self.settings, cli=True)
         ledger = IntegrityLedger(self.settings, key)

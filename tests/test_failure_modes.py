@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 import sys
 import unittest
@@ -315,12 +314,21 @@ class ProjectCompletenessTests(unittest.TestCase):
             "printproxy.py",
             "printproxy_core.py",
             "printproxyctl.py",
+            "receipt_renderer.py",
             "docs/ARCHITECTURE.md",
+            "docs/ESCPOS_PROTOCOL.md",
             "docs/INSTALLATION.md",
+            "docs/RECEIPT_RENDERING.md",
             "docs/TROUBLESHOOTING.md",
             "docs/SECURITY.md",
             "docs/RECOVERY.md",
+            "docs/TCP_PROXY.md",
+            "docs/TEST_REPORT.md",
+            "examples/generate_sample_receipt.py",
             "systemd/printproxy.service",
+            "tests/fake_escpos_printer.py",
+            "tests/test_duplex_proxy.py",
+            "tests/test_receipt_renderer.py",
         ]
         missing = [name for name in required if not (root / name).is_file()]
         self.assertEqual(missing, [])

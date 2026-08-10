@@ -47,16 +47,40 @@ sudo systemctl start printproxy
 
 Un warning NTP impedisce di attribuire precisione affidabile ai timestamp ma non li trasforma mai in marca certificata.
 
-## Pilot consigliato
+## Acceptance `transparent_duplex`
 
-Eseguire almeno 30 job rappresentativi e verificare:
+Prima del pilot verificare che la configurazione effettiva contenga
+`DELIVERY_MODE=transparent_duplex` e che non esista backlog legacy replayable.
+Eseguire almeno 30 job rappresentativi, includendo obbligatoriamente il percorso
+inverso stampante → gestionale, e verificare:
 
-- un RAW per stampa attesa o la segmentazione prevista;
-- hash con la procedura offline `printproxyctl verify`;
+- un RAW per stampa attesa o la segmentazione prevista, identico byte per byte al
+  flusso inviato dal gestionale;
+- i quattro artefatti di cortesia per un job completo (`.raw`, `.txt`,
+  `.PULITO.txt`, `.pdf`), il relativo JSON e tutti gli SHA-256 autenticati con la
+  procedura offline `printproxyctl verify`;
 - output fisico identico per ASCII, accenti, euro, raster, QR/barcode e taglio;
-- nessun `DLE EOT`/status atteso dal gestionale;
-- massimo gap intra-job e gap inter-job;
-- riavvio controllato con coda vuota e con stampante offline.
+- una richiesta reale `DLE EOT n` supportata dal firmware: registrare il byte o
+  i byte restituiti con collegamento diretto alla POS80BL, ripetere attraverso il
+  proxy e confrontare i due flussi byte per byte; non imporre o simulare `0x12`;
+- half-close client: dopo `shutdown(SHUT_WR)` il gestionale deve continuare a
+  ricevere integralmente uno status ritardato o frammentato fino a FIN stampante
+  o al timeout di tail configurato;
+- eventuali byte ASB/server-first e il loro comportamento sul firmware reale;
+- massimo gap intra-job e gap inter-job, compresi i segmenti su connessione
+  persistente;
+- esclusione tra sessioni concorrenti: il secondo client deve ricevere il
+  fail-fast documentato e nessun byte dei due client deve essere interleavato;
+- riavvio controllato senza sessioni live; un crash simulato dopo
+  `DUPLEX_ACTIVE` deve produrre `UNKNOWN_PRINT_STATE` con
+  `retry_allowed=false`, senza replay automatico o manuale;
+- stampante offline: la sessione duplex deve fallire in modo osservabile al
+  gestionale e non deve essere trasformata in un job FIFO da ristampare in
+  seguito.
+
+Il modello FIFO/offline/retry appartiene esclusivamente a
+`DELIVERY_MODE=store_forward` legacy e non costituisce un test valido del
+percorso duplex.
 
 Se il gestionale apre una connessione per job, preferire:
 

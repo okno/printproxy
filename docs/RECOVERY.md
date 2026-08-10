@@ -12,31 +12,52 @@ Per un audit completo: `stop` graceful, `sudo printproxyctl verify`, quindi `sta
 Al boot:
 
 - `RECEIVING`/`.tmp` diventa `PARTIAL`;
-- `SEND_ARMED` diventa pre-send fallito e può essere ritentato;
-- `SENDING` diventa `UNKNOWN_PRINT_STATE`;
-- `QUEUED`/`FAILED_BEFORE_SEND` viene ricostruito nella coda;
+- in `store_forward`, `SEND_ARMED` diventa pre-send fallito e può essere
+  ritentato;
+- in `store_forward`, `SENDING` diventa `UNKNOWN_PRINT_STATE` e
+  `QUEUED`/`FAILED_BEFORE_SEND` viene ricostruito nella coda;
+- in `transparent_duplex`, `DUPLEX_ACTIVE` diventa
+  `UNKNOWN_PRINT_STATE` con `retry_allowed=false`: non viene mai reinserito in
+  coda e non è ammesso replay;
 - file/hash incoerenti diventano `QUARANTINED`.
 
 ## Stampante offline prolungata
 
-La FIFO resta su disco. Con ordine preservato, il job più vecchio effettua backoff e i successivi attendono. Ripristinare rete/alimentazione e osservare:
+Con `DELIVERY_MODE=store_forward` legacy, la FIFO resta su disco. Con ordine
+preservato, il job più vecchio effettua backoff e i successivi attendono.
+Ripristinare rete/alimentazione e osservare:
 
 ```bash
 journalctl -u printproxy -f
 sudo printproxyctl queue
 ```
 
+Con `DELIVERY_MODE=transparent_duplex` non esiste una FIFO di replay: il proxy
+apre la stampante prima di consumare il payload e segnala il fallimento TCP al
+gestionale. Se una write era già possibile, lo stato resta incerto e non viene
+ristampato. Dopo il controllo fisico e il ripristino della stampante, solo il
+gestionale può iniziare consapevolmente una nuova sessione.
+
 ## Crash/power loss durante invio
 
-Non riavviare manualmente gli unknown. Documentare:
+Non riavviare o ritentare alla cieca gli unknown. Documentare:
 
 - job ID e hash;
 - intervallo temporale;
 - byte affidati allo stack locale (solo metrica);
 - presenza/assenza della stampa fisica;
-- decisione e responsabile del retry.
+- modalità di consegna, decisione operativa e responsabile.
 
-Il comando con `--confirm-unknown` aggiunge un evento audit e reinserisce il job mantenendo la sequenza FIFO originale.
+Solo per un job legacy `store_forward` esplicitamente retryable, il comando con
+`--confirm-unknown` aggiunge un evento audit e reinserisce il job mantenendo la
+sequenza FIFO originale; resta una decisione manuale con rischio di duplicato
+fisico.
+
+Un job `transparent_duplex` ha `retry_allowed=false`: `printproxyctl retry`,
+anche con `--confirm-unknown`, deve rifiutarlo. Il RAW duplex contiene una
+conversazione interattiva e non può essere riprodotto come flusso unidirezionale.
+Se serve una nuova stampa, deve essere il gestionale ad aprire una nuova sessione
+dopo verifica fisica e decisione tracciata dell'operatore.
 
 ## Corruzione manifest o RAW
 

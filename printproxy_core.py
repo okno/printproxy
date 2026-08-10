@@ -17,9 +17,7 @@ import os
 import re
 import shutil
 import stat
-import tempfile
 import threading
-import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,22 +26,26 @@ from typing import Any, Iterator, Mapping
 
 
 SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 ZERO_HASH = "0" * 64
 TERMINAL_STATES = {
     "PARTIAL",
     "SENT_UNCONFIRMED",
     "UNKNOWN_PRINT_STATE",
+    "DUPLEX_ABORTED",
     "QUARANTINED",
     "RETENTION_DELETED",
 }
 SAFE_RETRY_STATES = {"QUEUED", "FAILED_BEFORE_SEND"}
-UNCERTAIN_STATES = {"SENDING", "UNKNOWN_PRINT_STATE"}
+UNCERTAIN_STATES = {"SENDING", "DUPLEX_ACTIVE", "UNKNOWN_PRINT_STATE"}
 STATE_LATEST_EVENTS = {
     "SEALED": {"ARCHIVED"},
     "QUEUED": {"QUEUED", "MANUAL_RETRY_QUEUED"},
     "FAILED_BEFORE_SEND": {"FAILED_BEFORE_SEND", "FAILED_BEFORE_SEND_RECOVERY"},
     "SEND_ARMED": {"SEND_ARMED"},
     "SENDING": {"SENDING"},
+    "DUPLEX_ACTIVE": {"DUPLEX_ACTIVE"},
+    "DUPLEX_ABORTED": {"DUPLEX_ABORTED"},
     "SENT_UNCONFIRMED": {"SENT_UNCONFIRMED"},
     "UNKNOWN_PRINT_STATE": {"UNKNOWN_PRINT_STATE", "UNKNOWN_PRINT_STATE_RECOVERY"},
     "PARTIAL": {"PARTIAL_ARCHIVED"},
@@ -52,7 +54,9 @@ STATE_LATEST_EVENTS = {
     "RETENTION_DELETED": {"RETENTION_DELETED"},
 }
 
-METADATA_STATE_FIELDS = (
+# Version 1 is immutable: existing metadata documents and their ledger HMACs
+# must remain byte-for-byte verifiable after an upgrade.
+METADATA_STATE_FIELDS_V1 = (
     "job_id",
     "session_id",
     "state",
@@ -98,6 +102,35 @@ METADATA_STATE_FIELDS = (
     "operator_action",
 )
 
+METADATA_STATE_FIELDS_V2 = METADATA_STATE_FIELDS_V1 + (
+    "bytes_client_to_printer",
+    "bytes_printer_received",
+    "bytes_submitted_to_client",
+    "bytes_printer_to_client",
+    "printer_response_hex",
+    "printer_response_truncated",
+    "printer_response_sha256",
+    "printer_response_delivered_sha256",
+    "realtime_status_queries",
+    "parsed_realtime_status_queries",
+    "client_fin_received",
+    "printer_fin_received",
+    "client_close_kind",
+    "printer_close_kind",
+    "retry_allowed",
+    "full_duplex",
+    "clean_filename",
+    "pdf_filename",
+    "clean_sha256",
+    "pdf_sha256",
+    "render_status",
+    "render_completed_at",
+)
+
+# New code may import the current field set, but serialization always selects a
+# set from the state schema below.
+METADATA_STATE_FIELDS = METADATA_STATE_FIELDS_V2
+
 
 class ConfigError(ValueError):
     """Configuration is missing, malformed or unsafe."""
@@ -127,8 +160,15 @@ def canonical_json(value: Any) -> bytes:
 
 
 def metadata_document_from_state(state: Mapping[str, Any]) -> dict[str, Any]:
-    document: dict[str, Any] = {"schema_version": SCHEMA_VERSION}
-    document.update({field: state.get(field) for field in METADATA_STATE_FIELDS})
+    version = state.get("schema_version", SCHEMA_VERSION)
+    if version == 1:
+        fields = METADATA_STATE_FIELDS_V1
+    elif version == STATE_SCHEMA_VERSION:
+        fields = METADATA_STATE_FIELDS_V2
+    else:
+        raise IntegrityError(f"unsupported operational state schema: {version!r}")
+    document: dict[str, Any] = {"schema_version": version}
+    document.update({field: state.get(field) for field in fields})
     return document
 
 
@@ -186,6 +226,7 @@ class Settings:
     data_dir: Path
     spool_dir: Path
     log_dir: Path
+    delivery_mode: str
     job_end_mode: str
     idle_timeout: float
     initial_data_timeout: float
@@ -198,8 +239,17 @@ class Settings:
     max_concurrent_clients: int
     max_concurrent_sidecars: int
     fsync_interval_bytes: int
+    full_duplex: bool
+    max_session_duration: float
+    printer_response_timeout: float
+    max_printer_response_capture_bytes: int
+    debug_hexdump: bool
+    debug_hexdump_max_bytes: int
     enable_readable_dump: bool
     max_readable_dump_bytes: int
+    save_clean_text: bool
+    save_pdf: bool
+    pdf_width_mm: float
     enable_hex_dump: bool
     default_codepage: str
     enable_hash_chain: bool
@@ -283,8 +333,20 @@ DEFAULTS: dict[str, str] = {
     "MAX_CONCURRENT_CLIENTS": "32",
     "MAX_CONCURRENT_SIDECARS": "2",
     "FSYNC_INTERVAL_BYTES": "262144",
+    # Compatibility-safe default for an existing configuration that predates
+    # DELIVERY_MODE. New installations ship an explicit transparent_duplex
+    # value in config/printproxy.conf.
+    "DELIVERY_MODE": "store_forward",
+    "MAX_SESSION_DURATION": "900",
+    "PRINTER_RESPONSE_TIMEOUT": "5",
+    "MAX_PRINTER_RESPONSE_CAPTURE_BYTES": "65536",
+    "DEBUG_HEXDUMP": "no",
+    "DEBUG_HEXDUMP_MAX_BYTES": "256",
     "ENABLE_READABLE_DUMP": "yes",
     "MAX_READABLE_DUMP_BYTES": "1048576",
+    "SAVE_CLEAN_TXT": "yes",
+    "SAVE_PDF": "yes",
+    "PDF_WIDTH_MM": "80",
     "ENABLE_HEX_DUMP": "no",
     "DEFAULT_CODEPAGE": "cp858",
     "HASH_ALGORITHM": "sha256",
@@ -371,6 +433,11 @@ def load_settings(path: str | os.PathLike[str]) -> Settings:
         raise ConfigError("ENABLE_HASH_CHAIN=no is unsupported; the audit ledger is mandatory")
     if raw["PROXY_PROTOCOL"].lower() != "raw":
         raise ConfigError("this release safely supports only PROXY_PROTOCOL=raw")
+    delivery_mode = raw["DELIVERY_MODE"].lower()
+    if delivery_mode not in {"store_forward", "transparent_duplex"}:
+        raise ConfigError(
+            "DELIVERY_MODE must be store_forward or transparent_duplex"
+        )
 
     mode = raw["JOB_END_MODE"].lower()
     if mode not in {"connection_close", "idle_timeout", "hybrid"}:
@@ -415,6 +482,7 @@ def load_settings(path: str | os.PathLike[str]) -> Settings:
         data_dir=data_dir,
         spool_dir=spool_dir,
         log_dir=log_dir,
+        delivery_mode=delivery_mode,
         job_end_mode=mode,
         idle_timeout=parse_float(raw["IDLE_TIMEOUT"], "IDLE_TIMEOUT", 0.1, 3600),
         initial_data_timeout=parse_float(raw["INITIAL_DATA_TIMEOUT"], "INITIAL_DATA_TIMEOUT", 0.1, 3600),
@@ -429,10 +497,30 @@ def load_settings(path: str | os.PathLike[str]) -> Settings:
             raw["MAX_CONCURRENT_SIDECARS"], "MAX_CONCURRENT_SIDECARS", 1, 16
         ),
         fsync_interval_bytes=parse_int(raw["FSYNC_INTERVAL_BYTES"], "FSYNC_INTERVAL_BYTES", 1, 1073741824),
+        full_duplex=delivery_mode == "transparent_duplex",
+        max_session_duration=parse_float(
+            raw["MAX_SESSION_DURATION"], "MAX_SESSION_DURATION", 1, 86400
+        ),
+        printer_response_timeout=parse_float(
+            raw["PRINTER_RESPONSE_TIMEOUT"], "PRINTER_RESPONSE_TIMEOUT", 0.1, 300
+        ),
+        max_printer_response_capture_bytes=parse_int(
+            raw["MAX_PRINTER_RESPONSE_CAPTURE_BYTES"],
+            "MAX_PRINTER_RESPONSE_CAPTURE_BYTES",
+            0,
+            16777216,
+        ),
+        debug_hexdump=parse_bool(raw["DEBUG_HEXDUMP"], "DEBUG_HEXDUMP"),
+        debug_hexdump_max_bytes=parse_int(
+            raw["DEBUG_HEXDUMP_MAX_BYTES"], "DEBUG_HEXDUMP_MAX_BYTES", 16, 65536
+        ),
         enable_readable_dump=parse_bool(raw["ENABLE_READABLE_DUMP"], "ENABLE_READABLE_DUMP"),
         max_readable_dump_bytes=parse_int(
             raw["MAX_READABLE_DUMP_BYTES"], "MAX_READABLE_DUMP_BYTES", 1024, 1048576
         ),
+        save_clean_text=parse_bool(raw["SAVE_CLEAN_TXT"], "SAVE_CLEAN_TXT"),
+        save_pdf=parse_bool(raw["SAVE_PDF"], "SAVE_PDF"),
+        pdf_width_mm=parse_float(raw["PDF_WIDTH_MM"], "PDF_WIDTH_MM", 48, 120),
         enable_hex_dump=parse_bool(raw["ENABLE_HEX_DUMP"], "ENABLE_HEX_DUMP"),
         default_codepage=raw["DEFAULT_CODEPAGE"],
         enable_hash_chain=parse_bool(raw["ENABLE_HASH_CHAIN"], "ENABLE_HASH_CHAIN"),
@@ -541,6 +629,33 @@ def read_regular_file_bytes(path: Path, *, max_bytes: int = 16 * 1024 * 1024) ->
             if total > max_bytes:
                 raise StorageError(f"file exceeds safe read limit: {path}")
         return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def read_regular_file_prefix(path: Path, *, max_bytes: int) -> tuple[bytes, bool]:
+    """Read at most ``max_bytes`` from one verified regular inode.
+
+    One extra byte is consumed only to report truncation.  This keeps optional
+    receipt rendering bounded without turning a large, otherwise valid RAW job
+    into a print-path failure.
+    """
+
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    fd = _open_regular_for_read(path)
+    try:
+        chunks: list[bytes] = []
+        total = 0
+        target = max_bytes + 1
+        while total < target:
+            chunk = os.read(fd, min(65536, target - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        value = b"".join(chunks)
+        return value[:max_bytes], len(value) > max_bytes
     finally:
         os.close(fd)
 
@@ -1236,6 +1351,43 @@ class IntegrityLedger:
                         errors.append(f"job {job_id}: SHA-256 mismatch")
                     if size != record.get("raw_size"):
                         errors.append(f"job {job_id}: size mismatch")
+                    if record.get("state_schema_version") == STATE_SCHEMA_VERSION:
+                        for filename_key, hash_key, suffix, label in (
+                            (
+                                "clean_filename",
+                                "clean_sha256",
+                                ".PULITO.txt",
+                                "clean receipt",
+                            ),
+                            ("pdf_filename", "pdf_sha256", ".pdf", "receipt PDF"),
+                        ):
+                            artifact_filename = record.get(filename_key)
+                            artifact_hash = record.get(hash_key)
+                            if artifact_filename is None:
+                                continue
+                            expected_name = Path(filename).with_suffix(suffix).name
+                            if (
+                                not isinstance(artifact_filename, str)
+                                or Path(artifact_filename).name != artifact_filename
+                                or artifact_filename != expected_name
+                            ):
+                                errors.append(f"job {job_id}: unsafe {label} filename")
+                                continue
+                            artifact_path = self.settings.data_dir / artifact_filename
+                            try:
+                                actual_artifact_hash, _ = sha256_file(artifact_path)
+                            except (OSError, StorageError) as exc:
+                                message = f"job {job_id}: {label} unavailable: {exc}"
+                                if record.get("render_status") == "complete":
+                                    errors.append(message)
+                                else:
+                                    warnings.append(message)
+                                continue
+                            if (
+                                not isinstance(artifact_hash, str)
+                                or not hmac.compare_digest(actual_artifact_hash, artifact_hash)
+                            ):
+                                errors.append(f"job {job_id}: {label} SHA-256 mismatch")
                     metadata_filename = record.get("metadata_filename")
                     metadata_hash = record.get("metadata_sha256")
                     if isinstance(metadata_filename, str) and Path(metadata_filename).name == metadata_filename:
@@ -1291,7 +1443,7 @@ class IntegrityLedger:
                     except (OSError, ValueError, TypeError, json.JSONDecodeError, StorageError) as exc:
                         errors.append(f"job {job_id}: operational state file unavailable: {exc}")
                         continue
-                    if state.get("schema_version") != SCHEMA_VERSION:
+                    if state.get("schema_version") not in {SCHEMA_VERSION, STATE_SCHEMA_VERSION}:
                         errors.append(f"job {job_id}: invalid operational state schema")
                     if state.get("pending_ledger_event") is not None:
                         errors.append(f"job {job_id}: durable ledger event requires recovery")

@@ -46,13 +46,13 @@ specifico commit, non una revisione non registrata della branch corrente:
 cd /srv/printproxy-src
 git fetch --tags --prune origin
 git tag --list
-RELEASE_REF='v1.0.2'
+RELEASE_REF='v2.0.0'
 git switch --detach "$RELEASE_REF"
 git show --no-patch --decorate --oneline HEAD
 git rev-parse HEAD
 ```
 
-Sostituire `v1.0.0` con il tag pubblicato. Se il tag è firmato e la chiave del
+Sostituire `v2.0.0` con il tag pubblicato. Se il tag è firmato e la chiave del
 maintainer è stata verificata tramite un canale indipendente, controllarlo anche
 con:
 
@@ -83,6 +83,7 @@ Verificare almeno:
 
 - `LISTEN_IP=10.1.2.220` e `VIRTUAL_PREFIX=24`;
 - `PRINTER_IP=10.1.2.200` e `PRINTER_PORT=9100`;
+- `DELIVERY_MODE=transparent_duplex` per inoltrare le risposte della stampante;
 - `ALLOWED_CLIENTS` con gli IP esatti dei gestionali, quando noti;
 - `ALLOWED_NETWORKS` limitato alla sola rete necessaria;
 - `DATA_DIR`, `SPOOL_DIR` e `LOG_DIR` sui percorsi previsti;
@@ -206,7 +207,8 @@ git switch main
 git pull --ff-only origin main
 git show --no-patch --decorate --oneline HEAD
 python3 -m unittest discover -s tests -v
-python3 -m py_compile printproxy.py printproxy_core.py printproxyctl.py
+python3 -m py_compile \
+  printproxy.py printproxy_core.py printproxyctl.py receipt_renderer.py
 sudo ./install.sh
 sudo printproxyctl self-test
 ```
@@ -232,7 +234,7 @@ Con il servizio già fermato e il backup già creato come nella sezione preceden
 cd /srv/printproxy-src
 git status --short
 git fetch --tags --prune origin
-NEW_RELEASE_REF='v1.1.0'
+NEW_RELEASE_REF='v2.0.0'
 git switch --detach "$NEW_RELEASE_REF"
 git show --no-patch --decorate --oneline HEAD
 python3 -m unittest discover -s tests -v
