@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m py_compile printproxy.py printproxy_core.py printproxyctl.py
+      - name: Unit and integration tests
+        run: python -m unittest discover -s tests
+
+  linux-packaging:
+    name: Linux packaging checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Validate production command
+        run: python -I printproxy.py --config config/printproxy.conf --check-config
+      - name: Validate shell syntax
+        run: bash -n install.sh uninstall.sh network/printproxy-vip network/printproxy-firewall
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y shellcheck
+      - name: Run ShellCheck
+        run: shellcheck install.sh uninstall.sh network/printproxy-vip network/printproxy-firewall

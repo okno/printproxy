@@ -1,0 +1,32 @@
+# Python/test artefacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local editor/OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Secrets and machine-local overrides
+.env
+.env.*
+*.key
+config/*.local
+config/*.override
+
+# Runtime print data must never be committed
+jobs/
+spool/
+logs/
+*.raw
+*.hex
+manifest.jsonl
+manifest.head.json
+*.tmp

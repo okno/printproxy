@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic reconciliation of the printproxy virtual IPv4 address
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+Unit=printproxy-vip-watch.service
+
+[Install]
+WantedBy=timers.target

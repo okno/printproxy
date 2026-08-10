@@ -1,0 +1,79 @@
+#!/bin/sh
+set -eu
+
+CONF=/etc/printproxy/printproxy.conf
+STATE=/etc/printproxy/install-state
+TABLE=printproxy_filter
+
+fail() {
+    echo "printproxy-firewall: $*" >&2
+    exit 1
+}
+
+get_value() {
+    key=$1
+    file=$2
+    awk -v wanted="$key" '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        {
+            pos = index($0, "=")
+            if (!pos) next
+            name = substr($0, 1, pos - 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+            if (name == wanted) {
+                value = substr($0, pos + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                gsub(/^['\''\"]|['\''\"]$/, "", value)
+                print value
+                exit
+            }
+        }
+    ' "$file"
+}
+
+[ -r "$CONF" ] || fail "missing configuration"
+ENABLED=$(get_value ENABLE_FIREWALL "$CONF")
+OWNED=$(get_value FIREWALL_OWNED "$STATE")
+if [ "${1:-}" = down ]; then
+    if [ "$OWNED" = yes ] && command -v nft >/dev/null 2>&1 && nft list table inet "$TABLE" >/dev/null 2>&1; then
+        nft delete table inet "$TABLE"
+    fi
+    exit 0
+fi
+[ "$ENABLED" = yes ] || exit 0
+command -v nft >/dev/null 2>&1 || fail "nft is required when ENABLE_FIREWALL=yes"
+
+VIP=$(get_value LISTEN_IP "$CONF")
+PORT=$(get_value LISTEN_PORT "$CONF")
+NETWORKS=$(get_value ALLOWED_NETWORKS "$CONF")
+CLIENTS=$(get_value ALLOWED_CLIENTS "$CONF")
+[ "$OWNED" = yes ] || fail "installer state does not own nftables table $TABLE"
+
+case "${1:-}" in
+    up)
+        RULESET=$(mktemp /run/printproxy-nft.XXXXXX)
+        trap 'rm -f -- "$RULESET"' EXIT HUP INT TERM
+        if nft list table inet "$TABLE" >/dev/null 2>&1; then
+            printf 'delete table inet %s\n' "$TABLE" >>"$RULESET"
+        fi
+        printf 'add table inet %s\n' "$TABLE" >>"$RULESET"
+        printf 'add chain inet %s input { type filter hook input priority -5; policy accept; }\n' "$TABLE" >>"$RULESET"
+        old_ifs=$IFS
+        IFS=,
+        SOURCES="${NETWORKS},${CLIENTS}"
+        for source in $SOURCES; do
+            source=$(printf '%s' "$source" | tr -d '[:space:]')
+            [ -n "$source" ] || continue
+            case "$source" in *[!0-9./]*) fail "unsafe ACL value" ;; esac
+            printf 'add rule inet %s input ip saddr %s ip daddr %s tcp dport %s accept\n' "$TABLE" "$source" "$VIP" "$PORT" >>"$RULESET"
+        done
+        IFS=$old_ifs
+        printf 'add rule inet %s input ip daddr %s tcp dport %s drop\n' "$TABLE" "$VIP" "$PORT" >>"$RULESET"
+        nft -c -f "$RULESET"
+        nft -f "$RULESET"
+        rm -f -- "$RULESET"
+        trap - EXIT HUP INT TERM
+        ;;
+    down) : ;;
+    *) fail "usage: $0 up|down" ;;
+esac

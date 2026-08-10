@@ -1,0 +1,12 @@
+/var/log/printproxy/printproxy.log {
+    daily
+    rotate 30
+    maxsize 20M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    dateext
+    create 0640 printproxy printproxy
+    su printproxy printproxy
+}

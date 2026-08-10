@@ -1,0 +1,57 @@
+[Unit]
+Description=Durable RAW TCP Print Proxy and Archive
+Documentation=file:/opt/printproxy/README.md
+Wants=network-online.target
+After=network-online.target printproxy-vip.service printproxy-firewall.service
+Requires=printproxy-firewall.service
+Requires=printproxy-vip.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=printproxy
+Group=printproxy
+UMask=0077
+WorkingDirectory=/var/lib/printproxy
+Environment=PYTHONUNBUFFERED=1
+LoadCredential=integrity.key:/etc/printproxy/integrity.key
+ExecStartPre=/usr/bin/python3 -I /opt/printproxy/printproxy.py --config /etc/printproxy/printproxy.conf --check-config
+ExecStart=/usr/bin/python3 -I /opt/printproxy/printproxy.py --config /etc/printproxy/printproxy.conf
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+PrivateMounts=yes
+KeyringMode=private
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/printproxy /var/log/printproxy
+ReadOnlyPaths=/etc/printproxy /opt/printproxy
+LimitNOFILE=4096
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

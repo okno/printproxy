@@ -1,0 +1,76 @@
+#!/bin/sh
+set -eu
+
+CONF=/etc/printproxy/printproxy.conf
+STATE=/etc/printproxy/install-state
+
+fail() {
+    echo "printproxy-vip: $*" >&2
+    exit 1
+}
+
+get_value() {
+    key=$1
+    file=$2
+    awk -v wanted="$key" '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        {
+            pos = index($0, "=")
+            if (pos == 0) next
+            name = substr($0, 1, pos - 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+            if (name == wanted) {
+                value = substr($0, pos + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                gsub(/^['\''\"]|['\''\"]$/, "", value)
+                print value
+                exit
+            }
+        }
+    ' "$file"
+}
+
+[ -r "$CONF" ] || fail "missing $CONF"
+[ -r "$STATE" ] || fail "missing installer state $STATE"
+
+VIP=$(get_value LISTEN_IP "$CONF")
+PREFIX=$(get_value VIRTUAL_PREFIX "$CONF")
+CONFIG_IFACE=$(get_value NETWORK_INTERFACE "$CONF")
+OWNED=$(get_value VIP_OWNED "$STATE")
+STATE_IFACE=$(get_value INTERFACE "$STATE")
+PRINTER=$(get_value PRINTER_IP "$CONF")
+
+case "$VIP" in *[!0-9.]*|'') fail "unsafe LISTEN_IP" ;; esac
+case "$PREFIX" in *[!0-9]*|'') fail "unsafe VIRTUAL_PREFIX" ;; esac
+case "$STATE_IFACE" in *[!A-Za-z0-9_.:@-]*|'') fail "unsafe interface in installer state" ;; esac
+
+if [ "$CONFIG_IFACE" = auto ]; then
+    ROUTE_IFACE=$(ip -o route get "$PRINTER" 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')
+    [ -n "$ROUTE_IFACE" ] || fail "cannot resolve route interface for $PRINTER"
+    [ "$ROUTE_IFACE" = "$STATE_IFACE" ] || fail "route interface changed: expected $STATE_IFACE, found $ROUTE_IFACE"
+    IFACE=$STATE_IFACE
+else
+    [ "$CONFIG_IFACE" = "$STATE_IFACE" ] || fail "configured interface differs from installer state"
+    IFACE=$STATE_IFACE
+fi
+
+case "${1:-}" in
+    up)
+        EXISTING=$(ip -o -4 addr show | awk -v ip="$VIP" '$4 ~ ("^" ip "/") {print $2; exit}')
+        if [ -n "$EXISTING" ]; then
+            [ "$EXISTING" = "$IFACE" ] || fail "$VIP already exists on $EXISTING"
+            exit 0
+        fi
+        [ "$OWNED" = yes ] || fail "$VIP was pre-existing at install but is now missing; refusing to recreate an address not owned by printproxy"
+        command -v arping >/dev/null 2>&1 || fail "arping is required for duplicate-address detection"
+        arping -D -q -I "$IFACE" -c 3 -w 3 "$VIP" || fail "$VIP is in use by another host"
+        ip address add "$VIP/$PREFIX" dev "$IFACE"
+        ;;
+    down)
+        [ "$OWNED" = yes ] || exit 0
+        if ip -o -4 addr show dev "$IFACE" | awk -v ip="$VIP" '$4 ~ ("^" ip "/") {found=1} END {exit !found}'; then
+            ip address del "$VIP/$PREFIX" dev "$IFACE"
+        fi
+        ;;
+    *) fail "usage: $0 up|down" ;;
+esac
