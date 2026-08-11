@@ -260,23 +260,24 @@ deadline del test è separata dai valori di produzione.
 
 ## Record di esecuzione release
 
-Compilare dopo il freeze del commit:
+Prima matrice CI pubblica eseguita sul commit applicativo congelato:
 
 | Campo | Valore |
 |---|---|
-| commit SHA | DA COMPILARE |
-| tag | DA COMPILARE |
-| data UTC | DA COMPILARE |
-| Ubuntu / Python 3.11 | DA COMPILARE |
-| Ubuntu / Python 3.13 | DA COMPILARE |
-| Windows / Python 3.11 | DA COMPILARE |
-| Windows / Python 3.13 | DA COMPILARE |
-| packaging/shellcheck | DA COMPILARE |
-| skip motivati | DA COMPILARE |
-| link CI | DA COMPILARE |
+| commit SHA | `d8572e25f82fe51b0eda63d5fc27e4a6c875414b` |
+| tag | `v3.0.0` |
+| data UTC | `2026-08-11T01:49:55Z` - `2026-08-11T01:50:59Z` |
+| Ubuntu / Python 3.11 | 145 test, OK |
+| Ubuntu / Python 3.13 | 145 test, OK |
+| Windows / Python 3.11 | 145 test, OK, 4 skip di piattaforma |
+| Windows / Python 3.13 | 145 test, OK, 4 skip di piattaforma |
+| packaging/shellcheck | OK |
+| skip motivati | Tesseract non installato su Windows; test dirfd/setuid POSIX |
+| link CI | [GitHub Actions run 31450501917](https://github.com/okno/printproxy/actions/runs/31450501917) |
 
-Non sostituire `DA COMPILARE` con un risultato locale precedente al commit
-finale.
+Il tag comprende esclusivamente questo commit applicativo e l'aggiornamento
+documentale del relativo record CI. Il collaudo hardware resta separato e non è
+implicato dall'esito della matrice software.
 
 ## Collaudo hardware POS80BL richiesto
 
