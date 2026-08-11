@@ -51,10 +51,20 @@ conf_get() {
     ' "$file"
 }
 
-PRINTER_IP=$(conf_get PRINTER_IP "$CONFIG_FILE")
-PRINTER_PORT=$(conf_get PRINTER_PORT "$CONFIG_FILE")
-echo "IMPORTANT: first restore the management software printer destination to ${PRINTER_IP:-10.1.2.200}:${PRINTER_PORT:-9100}."
-echo 'Stopping the proxy before that change makes printing unavailable.'
+split_csv() {
+    local value=$1 output_name=$2 item
+    local -a raw_items=()
+    local -n output=$output_name
+    output=()
+    [[ -n $value ]] || return 0
+    IFS=',' read -r -a raw_items <<<"$value"
+    for item in "${raw_items[@]}"; do
+        item=${item#"${item%%[![:space:]]*}"}
+        item=${item%"${item##*[![:space:]]}"}
+        [[ -n $item ]] || { echo 'Unsafe empty CSV entry.' >&2; exit 1; }
+        output+=("$item")
+    done
+}
 
 install -d -m 0700 -o root -g root "$BACKUP_ROOT"
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -85,17 +95,90 @@ artifact_matches() {
     [[ $actual == "$expected" ]]
 }
 
-VIP_OWNED=$(conf_get VIP_OWNED "$STATE_FILE")
-VIP=$(conf_get VIP "$STATE_FILE")
+VIP_CSV=$(conf_get VIP_LIST "$STATE_FILE")
+VIP_OWNED_CSV=$(conf_get VIP_OWNED_LIST "$STATE_FILE")
+[[ -n $VIP_CSV ]] || VIP_CSV=$(conf_get VIP "$STATE_FILE")
+[[ -n $VIP_OWNED_CSV ]] || VIP_OWNED_CSV=$(conf_get VIP_OWNED "$STATE_FILE")
+declare -a VIPS=() VIP_OWNERS=()
+split_csv "$VIP_CSV" VIPS
+split_csv "$VIP_OWNED_CSV" VIP_OWNERS
+((${#VIPS[@]} == ${#VIP_OWNERS[@]})) || { echo 'Installer state has mismatched VIP ownership lists.' >&2; exit 1; }
+for owned in "${VIP_OWNERS[@]}"; do
+    case "$owned" in yes|no) ;; *) echo 'Installer state has unsafe VIP ownership.' >&2; exit 1 ;; esac
+done
 FIREWALL_OWNED=$(conf_get FIREWALL_OWNED "$STATE_FILE")
-if [[ $VIP_OWNED == yes ]] && ! artifact_matches /usr/local/libexec/printproxy-vip; then
-    echo 'Owned VIP helper is missing or modified; refusing to execute it as root. Remove the exact VIP manually, then retry.' >&2
+case "$FIREWALL_OWNED" in yes|no) ;; *) echo 'Installer state has unsafe firewall ownership.' >&2; exit 1 ;; esac
+
+# Schema 4 makes archive/spool deletion and preservation hints independent from
+# a subsequently edited config.  A legacy state may use the config only for a
+# non-destructive preservation hint; destructive purge requires state identity.
+DATA_DIR=$(conf_get DATA_DIR "$STATE_FILE")
+SPOOL_DIR=$(conf_get SPOOL_DIR "$STATE_FILE")
+LOG_DIR=$(conf_get LOG_DIR "$STATE_FILE")
+if [[ -n $DATA_DIR || -n $SPOOL_DIR ]]; then
+    [[ -n $DATA_DIR && -n $SPOOL_DIR ]] || {
+        echo 'Installer state has incomplete storage path identity.' >&2
+        exit 1
+    }
+elif [[ $PURGE_DATA == yes ]]; then
+    echo 'REFUSED: legacy installer state has no authoritative DATA_DIR/SPOOL_DIR; preserve data and perform an explicit verified cleanup.' >&2
+    exit 1
+else
+    DATA_DIR=$(conf_get DATA_DIR "$CONFIG_FILE")
+    SPOOL_DIR=$(conf_get SPOOL_DIR "$CONFIG_FILE")
+    LOG_DIR=$(conf_get LOG_DIR "$CONFIG_FILE")
+    echo 'Legacy installer state: config paths are shown only as non-destructive preservation hints.' >&2
+fi
+
+# Schema 3+ keeps rollback instructions independent from a subsequently edited
+# config.  Legacy states fall back to config only for the human-facing hint;
+# cleanup ownership still comes exclusively from installer state.
+PRINTER_IP_CSV=$(conf_get PRINTER_IP_LIST "$STATE_FILE")
+PRINTER_PORT_CSV=$(conf_get PRINTER_PORT_LIST "$STATE_FILE")
+MAPPING_STATE=no
+if [[ -n $PRINTER_IP_CSV || -n $PRINTER_PORT_CSV ]]; then
+    [[ -n $PRINTER_IP_CSV && -n $PRINTER_PORT_CSV ]] || {
+        echo 'Installer state has incomplete printer endpoint lists.' >&2
+        exit 1
+    }
+    MAPPING_STATE=yes
+else
+    PRINTER_IP_CSV=$(conf_get PRINTER_IP "$CONFIG_FILE")
+    PRINTER_PORT_CSV=$(conf_get PRINTER_PORT "$CONFIG_FILE")
+fi
+declare -a PRINTER_IPS=() PRINTER_PORTS=()
+split_csv "$PRINTER_IP_CSV" PRINTER_IPS
+split_csv "$PRINTER_PORT_CSV" PRINTER_PORTS
+if [[ $MAPPING_STATE == yes ]] && \
+   ((${#PRINTER_IPS[@]} != ${#VIPS[@]} || ${#PRINTER_PORTS[@]} != ${#VIPS[@]})); then
+    echo 'Installer state has mismatched printer endpoint lists.' >&2
     exit 1
 fi
-if [[ $FIREWALL_OWNED == yes ]] && ! artifact_matches /usr/local/libexec/printproxy-firewall; then
-    echo 'Owned firewall helper is missing or modified; refusing to execute it as root. Remove the exact table manually, then retry.' >&2
-    exit 1
+echo 'IMPORTANT: first restore every management-software destination to its physical printer:'
+if ((${#PRINTER_IPS[@]} && ${#PRINTER_IPS[@]} == ${#PRINTER_PORTS[@]})); then
+    for index in "${!PRINTER_IPS[@]}"; do
+        printf '  proxy-%03d -> %s:%s\n' "$((index + 1))" "${PRINTER_IPS[$index]}" "${PRINTER_PORTS[$index]}"
+    done
+else
+    echo '  Endpoint legacy non disponibile nello state; verificare config e storico prima di fermare il servizio.'
 fi
+echo 'Stopping the proxy before that change makes printing unavailable.'
+
+for privileged_helper in \
+    /usr/local/libexec/printproxy-vip \
+    /usr/local/libexec/printproxy-firewall \
+    /etc/systemd/system/printproxy.service \
+    /etc/systemd/system/printproxy-vip.service \
+    /etc/systemd/system/printproxy-firewall.service \
+    /etc/systemd/system/printproxy-vip-watch.service \
+    /etc/systemd/system/printproxy-vip-watch.timer \
+    /etc/systemd/system/printproxy.service.d/paths.conf; do
+    if ! artifact_matches "$privileged_helper"; then
+        echo "Privileged lifecycle artifact is missing or modified; refusing systemd/helper execution: $privileged_helper" >&2
+        echo 'Use the recovery backup and remove exact owned resources manually before retrying.' >&2
+        exit 1
+    fi
+done
 
 systemctl stop printproxy.service 2>/dev/null || true
 if systemctl is-active --quiet printproxy.service 2>/dev/null; then
@@ -116,13 +199,22 @@ if [[ -x /usr/local/libexec/printproxy-vip ]]; then
     /usr/local/libexec/printproxy-vip down 2>/dev/null || true
 fi
 
-if [[ $VIP_OWNED == yes && -n $VIP ]] && ip -o -4 addr show | awk -v ip="$VIP" '$4 ~ ("^" ip "/") {found=1} END {exit !found}'; then
-    echo "Owned VIP $VIP could not be removed; helpers and installer state are being preserved." >&2
-    exit 1
-fi
-if [[ $FIREWALL_OWNED == yes ]] && command -v nft >/dev/null 2>&1 && nft list table inet printproxy_filter >/dev/null 2>&1; then
-    echo 'Owned nftables table could not be removed; helpers and installer state are being preserved.' >&2
-    exit 1
+for index in "${!VIPS[@]}"; do
+    vip=${VIPS[$index]}
+    if [[ ${VIP_OWNERS[$index]} == yes ]] && ip -o -4 addr show | awk -v ip="$vip" '$4 ~ ("^" ip "/") {found=1} END {exit !found}'; then
+        echo "Owned VIP $vip could not be removed; helpers and installer state are being preserved." >&2
+        exit 1
+    fi
+done
+if [[ $FIREWALL_OWNED == yes ]]; then
+    command -v nft >/dev/null 2>&1 || {
+        echo 'Cannot verify removal of the owned nftables table because nft is unavailable; preserving installer state.' >&2
+        exit 1
+    }
+    if nft list table inet printproxy_filter >/dev/null 2>&1; then
+        echo 'Owned nftables table could not be removed; helpers and installer state are being preserved.' >&2
+        exit 1
+    fi
 fi
 
 remove_owned_file() {
@@ -173,10 +265,6 @@ if [[ -d /etc/systemd/system/printproxy.service.d ]]; then
 fi
 systemctl daemon-reload
 
-DATA_DIR=$(conf_get DATA_DIR "$CONFIG_FILE")
-SPOOL_DIR=$(conf_get SPOOL_DIR "$CONFIG_FILE")
-LOG_DIR=$(conf_get LOG_DIR "$CONFIG_FILE")
-
 if [[ $PURGE_DATA == yes ]]; then
     for target in "$DATA_DIR" "$SPOOL_DIR" "$LOG_DIR"; do
         case "$target" in
@@ -203,4 +291,4 @@ else
     echo "Configuration and HMAC key preserved in $CONFIG_DIR"
 fi
 
-echo "Uninstall complete. Direct printing target: ${PRINTER_IP:-10.1.2.200}:${PRINTER_PORT:-9100}."
+echo 'Uninstall complete. Direct printing targets are the physical printer endpoints listed above.'

@@ -27,6 +27,19 @@ PRINTER_IP=10.1.2.200
 PRINTER_PORT=9100
 ```
 
+Con liste CSV, ogni indice crea una sessione e un lock indipendenti; una route
+non consulta mai la destinazione di un'altra:
+
+```text
+10.1.2.220:9100 <-> 10.1.2.200:9100
+10.1.2.221:9100 <-> 10.1.2.201:9100
+10.1.2.222:9100 <-> 10.1.2.202:9100
+```
+
+Un errore di connessione a una stampante chiude soltanto quella sessione. Gli
+errori di bind durante lo startup sono invece transazionali: nessun listener
+inizia ad accettare finché tutti i bind non sono riusciti.
+
 `DELIVERY_MODE` deve comparire nel file. Durante un upgrade, l'installer rifiuta
 un file storico privo della chiave per evitare un passaggio implicito da
 store-and-forward a streaming live.

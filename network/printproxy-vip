@@ -6,6 +6,11 @@ STATE=/etc/printproxy/install-state
 
 fail() {
     echo "printproxy-vip: $*" >&2
+    if [ "${ROLLBACK:-no}" = yes ]; then
+        for added in ${ADDED:-}; do
+            ip address del "$added/$PREFIX" dev "$IFACE" 2>/dev/null || true
+        done
+    fi
     exit 1
 }
 
@@ -30,24 +35,79 @@ get_value() {
     ' "$file"
 }
 
-[ -r "$CONF" ] || fail "missing $CONF"
 [ -r "$STATE" ] || fail "missing installer state $STATE"
 
-VIP=$(get_value LISTEN_IP "$CONF")
-PREFIX=$(get_value VIRTUAL_PREFIX "$CONF")
-CONFIG_IFACE=$(get_value NETWORK_INTERFACE "$CONF")
-OWNED=$(get_value VIP_OWNED "$STATE")
-STATE_IFACE=$(get_value INTERFACE "$STATE")
-PRINTER=$(get_value PRINTER_IP "$CONF")
+value_at() {
+    printf '%s\n' "$1" | awk -F, -v wanted="$2" '{
+        if (wanted > NF) exit 1
+        value=$wanted
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+        if (value == "") exit 1
+        print value
+    }'
+}
 
-case "$VIP" in *[!0-9.]*|'') fail "unsafe LISTEN_IP" ;; esac
+VIP_LIST=$(get_value VIP_LIST "$STATE")
+[ -n "$VIP_LIST" ] || VIP_LIST=$(get_value VIP "$STATE")
+PREFIX=$(get_value PREFIX "$STATE")
+OWNED_LIST=$(get_value VIP_OWNED_LIST "$STATE")
+[ -n "$OWNED_LIST" ] || OWNED_LIST=$(get_value VIP_OWNED "$STATE")
+STATE_IFACE=$(get_value INTERFACE "$STATE")
+
+case "$VIP_LIST" in *[!0-9.,[:space:]]*|'') fail "unsafe VIP list" ;; esac
+case "$OWNED_LIST" in *[!a-z,[:space:]]*|'') fail "unsafe ownership list" ;; esac
 case "$PREFIX" in *[!0-9]*|'') fail "unsafe VIRTUAL_PREFIX" ;; esac
 case "$STATE_IFACE" in *[!A-Za-z0-9_.:@-]*|'') fail "unsafe interface in installer state" ;; esac
 
+VIP_COUNT=$(printf '%s\n' "$VIP_LIST" | awk -F, '{print NF}')
+OWNED_COUNT=$(printf '%s\n' "$OWNED_LIST" | awk -F, '{print NF}')
+[ "$VIP_COUNT" -eq "$OWNED_COUNT" ] || fail "VIP ownership count mismatch"
+
+case "${1:-}" in
+    down)
+        IFACE=$STATE_IFACE
+        index=1
+        while [ "$index" -le "$VIP_COUNT" ]; do
+            VIP=$(value_at "$VIP_LIST" "$index") || fail "invalid VIP list entry $index"
+            OWNED=$(value_at "$OWNED_LIST" "$index") || fail "invalid ownership list entry $index"
+            case "$VIP" in *[!0-9.]*|'') fail "unsafe VIP entry $index" ;; esac
+            case "$OWNED" in yes|no) ;; *) fail "unsafe ownership entry $index" ;; esac
+            if [ "$OWNED" = yes ] && ip -o -4 addr show dev "$IFACE" | awk -v ip="$VIP" '$4 ~ ("^" ip "/") {found=1} END {exit !found}'; then
+                ip address del "$VIP/$PREFIX" dev "$IFACE"
+            fi
+            index=$((index + 1))
+        done
+        exit 0
+        ;;
+    up) ;;
+    *) fail "usage: $0 up|down" ;;
+esac
+
+[ -r "$CONF" ] || fail "missing $CONF"
+RECEIPT=${PRINTPROXY_VIP_RECEIPT:-}
+if [ -n "$RECEIPT" ]; then
+    case "$RECEIPT" in /run/printproxy-vip-added.*) ;; *) fail "unsafe VIP receipt path" ;; esac
+    umask 077
+    : >"$RECEIPT" || fail "cannot initialize VIP receipt"
+fi
+
+CONFIG_PREFIX=$(get_value VIRTUAL_PREFIX "$CONF")
+[ "$CONFIG_PREFIX" = "$PREFIX" ] || fail "configured prefix differs from root-owned installer state"
+CONFIG_IFACE=$(get_value NETWORK_INTERFACE "$CONF")
+PRINTER_LIST=$(get_value PRINTER_IP "$CONF")
+case "$PRINTER_LIST" in *[!0-9.,[:space:]]*|'') fail "unsafe printer list" ;; esac
+PRINTER_COUNT=$(printf '%s\n' "$PRINTER_LIST" | awk -F, '{print NF}')
+[ "$VIP_COUNT" -eq "$PRINTER_COUNT" ] || fail "VIP/printer count mismatch"
+
 if [ "$CONFIG_IFACE" = auto ]; then
-    ROUTE_IFACE=$(ip -o route get "$PRINTER" 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')
-    [ -n "$ROUTE_IFACE" ] || fail "cannot resolve route interface for $PRINTER"
-    [ "$ROUTE_IFACE" = "$STATE_IFACE" ] || fail "route interface changed: expected $STATE_IFACE, found $ROUTE_IFACE"
+    index=1
+    while [ "$index" -le "$PRINTER_COUNT" ]; do
+        PRINTER=$(value_at "$PRINTER_LIST" "$index") || fail "invalid printer list entry $index"
+        ROUTE_IFACE=$(ip -o route get "$PRINTER" 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')
+        [ -n "$ROUTE_IFACE" ] || fail "cannot resolve route interface for $PRINTER"
+        [ "$ROUTE_IFACE" = "$STATE_IFACE" ] || fail "route interface for $PRINTER changed: expected $STATE_IFACE, found $ROUTE_IFACE"
+        index=$((index + 1))
+    done
     IFACE=$STATE_IFACE
 else
     [ "$CONFIG_IFACE" = "$STATE_IFACE" ] || fail "configured interface differs from installer state"
@@ -56,21 +116,28 @@ fi
 
 case "${1:-}" in
     up)
-        EXISTING=$(ip -o -4 addr show | awk -v ip="$VIP" '$4 ~ ("^" ip "/") {print $2; exit}')
-        if [ -n "$EXISTING" ]; then
-            [ "$EXISTING" = "$IFACE" ] || fail "$VIP already exists on $EXISTING"
-            exit 0
-        fi
-        [ "$OWNED" = yes ] || fail "$VIP was pre-existing at install but is now missing; refusing to recreate an address not owned by printproxy"
         command -v arping >/dev/null 2>&1 || fail "arping is required for duplicate-address detection"
-        arping -D -q -I "$IFACE" -c 3 -w 3 "$VIP" || fail "$VIP is in use by another host"
-        ip address add "$VIP/$PREFIX" dev "$IFACE"
-        ;;
-    down)
-        [ "$OWNED" = yes ] || exit 0
-        if ip -o -4 addr show dev "$IFACE" | awk -v ip="$VIP" '$4 ~ ("^" ip "/") {found=1} END {exit !found}'; then
-            ip address del "$VIP/$PREFIX" dev "$IFACE"
-        fi
+        ROLLBACK=yes
+        ADDED=
+        index=1
+        while [ "$index" -le "$VIP_COUNT" ]; do
+            VIP=$(value_at "$VIP_LIST" "$index") || fail "invalid VIP list entry $index"
+            OWNED=$(value_at "$OWNED_LIST" "$index") || fail "invalid ownership list entry $index"
+            case "$VIP" in *[!0-9.]*|'') fail "unsafe VIP entry $index" ;; esac
+            case "$OWNED" in yes|no) ;; *) fail "unsafe ownership entry $index" ;; esac
+            EXISTING=$(ip -o -4 addr show | awk -v ip="$VIP" '$4 ~ ("^" ip "/") {print $2; exit}')
+            if [ -n "$EXISTING" ]; then
+                [ "$EXISTING" = "$IFACE" ] || fail "$VIP already exists on $EXISTING"
+            else
+                [ "$OWNED" = yes ] || fail "$VIP was pre-existing at install but is now missing; refusing to recreate an address not owned by printproxy"
+                arping -D -q -I "$IFACE" -c 3 -w 3 "$VIP" || fail "$VIP is in use by another host"
+                ip address add "$VIP/$PREFIX" dev "$IFACE" || fail "cannot add $VIP/$PREFIX to $IFACE"
+                ADDED="$ADDED $VIP"
+                [ -z "$RECEIPT" ] || printf '%s\n' "$VIP" >>"$RECEIPT" || fail "cannot record added VIP"
+            fi
+            index=$((index + 1))
+        done
+        ROLLBACK=no
         ;;
     *) fail "usage: $0 up|down" ;;
 esac

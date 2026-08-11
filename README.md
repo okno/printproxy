@@ -1,9 +1,10 @@
 # Printproxy RAW/JetDirect full-duplex
 
-Printproxy è un proxy TCP trasparente per stampe di cortesia RAW/ESC-POS. Il
-gestionale si collega all'indirizzo virtuale del server Debian; Printproxy apre
-una sessione verso la stampante reale, inoltra simultaneamente entrambi i flussi
-senza reinterpretarli e archivia una copia del flusso client → stampante.
+Printproxy è un proxy TCP trasparente multi-stampante per stampe di cortesia
+RAW/ESC-POS. Il gestionale si collega a uno degli indirizzi virtuali del server
+Debian; la `ProxyInstance` associata apre una sessione verso la stampante reale,
+inoltra simultaneamente entrambi i flussi senza reinterpretarli e archivia una
+copia del flusso client → stampante nella directory di quella stampante.
 
 ```text
 Gestionale  <==== TCP byte-opaco ====>  Printproxy  <==== TCP byte-opaco ====>  POS80BL
@@ -71,18 +72,33 @@ Repository pubblico: <https://github.com/okno/printproxy>.
 ```bash
 sudo apt-get update
 sudo apt-get install --no-install-recommends -y git ca-certificates
-sudo git clone https://github.com/okno/printproxy.git /srv/printproxy-src
+sudo install -d -m 0755 -o "$(id -un)" -g "$(id -gn)" /srv/printproxy-src
+git clone https://github.com/okno/printproxy.git /srv/printproxy-src
 cd /srv/printproxy-src
 git fetch --tags --prune origin
 git switch --detach <TAG_RELEASE_VERIFICATO>
-sudo ./install.sh
+getent group printproxy >/dev/null || sudo groupadd --system printproxy
+sudo install -d -m 0750 -o root -g printproxy /etc/printproxy
+if ! sudo test -e /etc/printproxy/printproxy.conf; then
+  sudo install -m 0640 -o root -g printproxy \
+    config/printproxy.conf /etc/printproxy/printproxy.conf
+fi
+sudoedit /etc/printproxy/printproxy.conf
+sudo /usr/bin/python3 -I ./printproxy.py \
+  --config /etc/printproxy/printproxy.conf --check-config
+sudo ./install.sh --manage-vips
 ```
 
+Non eseguire l'installer prima di aver adattato mapping, ACL e modalità di
+consegna. La procedura completa e le varianti con VIP gestite esternamente sono
+in [GIT_DEPLOYMENT.md](docs/GIT_DEPLOYMENT.md).
+
 L'installer supporta Debian 12/13, installa solo le dipendenze mancanti
-(compreso `python3-reportlab`), valida configurazione, storage locale, unit
-systemd e logrotate, esegue DAD della VIP e attiva il servizio. La persistenza
-della VIP è additiva: non riscrive profili NetworkManager, file `.network` o
-`/etc/network/interfaces`.
+(compresi ReportLab e Tesseract ita+eng), valida configurazione, storage locale,
+unit systemd e logrotate. `--manage-vips` è l'autorizzazione esplicita a
+eseguire DAD e creare additivamente gli IP virtuali mancanti; senza il flag gli
+indirizzi devono già essere configurati. Non vengono riscritti profili
+NetworkManager, file `.network`, route, gateway o `/etc/network/interfaces`.
 
 Dettagli completi per clone, tag, upgrade, rollback e rimozione del clone sono in
 [GIT_DEPLOYMENT.md](docs/GIT_DEPLOYMENT.md). L'installazione operativa è descritta
@@ -119,7 +135,7 @@ arresta.
    sudo /usr/bin/python3 -I /srv/printproxy-src/printproxy.py \
      --config /etc/printproxy/printproxy.conf --check-config
    cd /srv/printproxy-src
-   sudo ./install.sh
+   sudo ./install.sh --manage-vips
    ```
 
 7. Eseguire self-test e test duplex con stampante/emulatore prima di cambiare il
@@ -164,6 +180,19 @@ DEFAULT_CODEPAGE=cp858
 ENABLE_HEX_DUMP=no
 ```
 
+Le stesse quattro chiavi di rete accettano liste CSV posizionali:
+
+```ini
+LISTEN_IP=10.1.2.220,10.1.2.221,10.1.2.222
+LISTEN_PORT=9100,9100,9100
+PRINTER_IP=10.1.2.200,10.1.2.201,10.1.2.202
+PRINTER_PORT=9100,9100,9100
+```
+
+Le lunghezze devono coincidere; IP, porte, elementi vuoti e duplicati vengono
+validati prima di aprire socket. Vedere [CONFIGURATION.md](docs/CONFIGURATION.md)
+e [MULTI_PRINTER.md](docs/MULTI_PRINTER.md).
+
 | Parametro | Effetto |
 |---|---|
 | `IDLE_TIMEOUT` | delimita un segmento d'archivio, non tronca di per sé il reverse stream |
@@ -205,7 +234,9 @@ di contenuto e un manifest JSON con la stessa base timestamp/UUID:
 
 - `.raw`: copia autoritativa byte-identica del client.
 - `.txt`: dump tecnico con comandi ESC/POS annotati.
-- `.PULITO.txt`: vista umana ottenuta dal Document Model ESC/POS.
+- `.PULITO.txt`: vista umana ottenuta dal Document Model ESC/POS; le sequenze
+  raster testuali vengono prima ricostruite e poi sottoposte a OCR bounded come
+  fallback, conservando provenienza e confidenza.
 - `.pdf`: ricevuta a larghezza configurabile, 80 mm di default e altezza
   variabile; incorpora i raster decodificati.
 - `.json`: stato, endpoint, conteggi per direzione, FIN/RST, hash, risposta
@@ -216,7 +247,9 @@ di contenuto e un manifest JSON con la stessa base timestamp/UUID:
 blocca né trasforma la sessione TCP: viene registrato nel JSON. Il RAW resta
 sempre la fonte forense.
 
-Il registro globale `manifest.jsonl` usa hash chain e HMAC-SHA-256; la head è in
+Con più mapping, gli artefatti e il relativo ledger sono sotto
+`jobs/<PRINTER_IP>/`; spool e lock sono sotto `spool/<PRINTER_IP>/`. Il registro
+`manifest.jsonl` di ogni route usa hash chain e HMAC-SHA-256; la head è in
 `manifest.head.json`. La chiave `/etc/printproxy/integrity.key` resta
 `root:root 0600` e non viene rigenerata durante un upgrade.
 
@@ -227,8 +260,8 @@ reali, il repository include un generatore sintetico:
 python3 examples/generate_sample_receipt.py /tmp/printproxy-sample
 ```
 
-L'esempio ricostruisce la ricevuta descritta nella documentazione ed è destinato
-solo alla verifica del renderer; non è una cattura della POS80BL reale.
+L'esempio genera esclusivamente una ricevuta inventata destinata alla verifica
+del renderer; non è una cattura della POS80BL reale.
 
 ## Verifica operativa
 
@@ -252,8 +285,15 @@ sudo systemctl start printproxy
 La prova fisica è esplicita:
 
 ```bash
-sudo printproxyctl test-print --confirm --text "TEST CORTESIA"
+sudo printproxyctl test-print --proxy-id proxy-001 --confirm --text "TEST CORTESIA"
 ```
+
+`test-print` apre una normale connessione locale alla VIP e non aggira ACL o
+firewall. Se `ALLOWED_CLIENTS` autorizza soltanto il gestionale remoto, il
+comando locale deve essere rifiutato. Eseguire allora la prova dal gestionale
+autorizzato; in alternativa aggiungere temporaneamente la VIP interessata a
+`ALLOWED_CLIENTS`, reinstallare/riavviare, fare il test e ripristinare subito
+l'ACL. Non lasciare un'eccezione locale implicita.
 
 Solo dopo un test autorizzato cambiare il gestionale da `10.1.2.200` a
 `10.1.2.220`, mantenendo TCP/9100 RAW.
@@ -266,7 +306,9 @@ python3 -m py_compile \
   printproxy.py printproxy_core.py printproxyctl.py receipt_renderer.py
 ```
 
-I test presenti coprono relay binario nelle due direzioni, DLE EOT, risposta
+I test presenti coprono tre listener e tre fake printer concorrenti senza
+cross-routing, isolamento di una stampante offline, relay binario nelle due
+direzioni, DLE EOT, risposta
 ritardata/frammentata, server-first, half-close, rifiuto del secondo client,
 recovery senza replay, parser, bitmap, rendering, spool e integrità. Il dettaglio
 è in [TEST_REPORT.md](docs/TEST_REPORT.md).
@@ -311,6 +353,8 @@ di purge sono intenzionalmente esplicite e documentate in
 ## Documentazione
 
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md): invarianti e stati.
+- [CONFIGURATION.md](docs/CONFIGURATION.md): chiavi e validazione CSV.
+- [MULTI_PRINTER.md](docs/MULTI_PRINTER.md): mapping, IP Debian e migrazione.
 - [TCP_PROXY.md](docs/TCP_PROXY.md): state machine full-duplex e packet capture.
 - [ESCPOS_PROTOCOL.md](docs/ESCPOS_PROTOCOL.md): status e parser ESC/POS.
 - [RECEIPT_RENDERING.md](docs/RECEIPT_RENDERING.md): AST, testo pulito e PDF.

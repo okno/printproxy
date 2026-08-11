@@ -10,6 +10,32 @@ ARTIFACT_MANIFEST=$CONFIG_DIR/artifacts.sha256
 OPT_DIR=/opt/printproxy
 BACKUP_ROOT=/var/backups/printproxy
 LOCK_FILE=/run/lock/printproxy-install.lock
+MANAGE_VIPS=no
+NETWORK_APPLIED=no
+MUTATION_STARTED=no
+INSTALL_COMMITTED=no
+HAD_INSTALL_STATE=no
+[[ -f $INSTALL_STATE && ! -L $INSTALL_STATE ]] && HAD_INSTALL_STATE=yes
+declare -a VIPS_APPLIED=()
+
+usage() {
+    cat <<'EOF'
+Usage: sudo ./install.sh [--manage-vips]
+
+By default the installer validates existing LISTEN_IP addresses but does not
+claim missing addresses. --manage-vips explicitly authorizes duplicate-address
+detection plus additive creation/persistence of the configured virtual IPs.
+No primary address, route, gateway or network-manager profile is rewritten.
+EOF
+}
+
+for argument in "$@"; do
+    case "$argument" in
+        --manage-vips) MANAGE_VIPS=yes ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'Unknown option: %s\n' "$argument" >&2; usage >&2; exit 2 ;;
+    esac
+done
 
 log() { printf '[printproxy-install] %s\n' "$*"; }
 warn() { printf '[printproxy-install] WARNING: %s\n' "$*" >&2; }
@@ -17,7 +43,33 @@ die() { printf '[printproxy-install] ERROR: %s\n' "$*" >&2; exit 1; }
 
 on_error() {
     code=$?
-    warn "installation stopped at line ${BASH_LINENO[0]} (exit $code). Existing network addresses, routes and gateway were not rewritten."
+    trap - ERR
+    if [[ ${INSTALL_COMMITTED:-no} != yes && ${MUTATION_STARTED:-no} == yes ]]; then
+        systemctl stop printproxy-vip-watch.timer printproxy-vip-watch.service \
+            printproxy.service printproxy-firewall.service printproxy-vip.service \
+            >/dev/null 2>&1 || true
+        if [[ ${NETWORK_APPLIED:-no} == yes && -n ${IFACE:-} && -n ${PREFIX:-} ]]; then
+            for rollback_vip in "${VIPS_APPLIED[@]-}"; do
+                [[ -n $rollback_vip ]] || continue
+                ip address del "$rollback_vip/$PREFIX" dev "$IFACE" 2>/dev/null || \
+                    warn "could not roll back newly applied VIP $rollback_vip/$PREFIX on $IFACE"
+            done
+        fi
+        if [[ -n ${BACKUP_DIR:-} && -f $BACKUP_DIR/install-state ]]; then
+            install -m 0600 -o root -g root "$BACKUP_DIR/install-state" "$INSTALL_STATE" || \
+                warn 'could not restore the previous installer state'
+        elif [[ ${HAD_INSTALL_STATE:-no} == no ]]; then
+            rm -f -- "$INSTALL_STATE" || true
+            systemctl disable printproxy.service printproxy-firewall.service \
+                printproxy-vip.service printproxy-vip-watch.timer >/dev/null 2>&1 || true
+        fi
+        sync -f "$CONFIG_DIR" 2>/dev/null || true
+        warn 'installation rollback left printproxy stopped; inspect the recovery backup before restarting'
+    elif [[ ${SERVICE_WAS_ACTIVE:-no} == yes ]]; then
+        warn 'printproxy.service was stopped for the security preflight and remains stopped'
+    fi
+    warn "installation stopped at line ${BASH_LINENO[0]} (exit $code). No primary address, route or gateway was rewritten."
+    [[ -z ${BACKUP_DIR:-} ]] || warn "Root-only recovery backup: $BACKUP_DIR"
     exit "$code"
 }
 trap on_error ERR
@@ -36,7 +88,10 @@ case "${VERSION_ID:-}" in
 esac
 [[ -d /run/systemd/system ]] || die 'systemd is required'
 
-declare -a packages=(python3 python3-reportlab iproute2 util-linux iputils-arping logrotate)
+declare -a packages=(
+    python3 python3-reportlab tesseract-ocr tesseract-ocr-ita
+    iproute2 util-linux iputils-arping logrotate
+)
 declare -a missing=()
 for package in "${packages[@]}"; do
     dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || missing+=("$package")
@@ -53,9 +108,14 @@ import sys
 assert sys.version_info >= (3, 11), sys.version
 import reportlab
 PY
+command -v tesseract >/dev/null 2>&1 || die 'tesseract OCR executable is required'
+tesseract --list-langs 2>/dev/null | grep -qx ita || die 'Italian Tesseract language data is required (tesseract-ocr-ita)'
 
 [[ -f "$PROJECT_DIR/printproxy.py" && -f "$PROJECT_DIR/printproxy_core.py" && \
    -f "$PROJECT_DIR/receipt_renderer.py" ]] || die 'run install.sh from the complete project directory'
+if [[ -e $INSTALL_STATE || -L $INSTALL_STATE ]]; then
+    [[ -f $INSTALL_STATE && ! -L $INSTALL_STATE ]] || die "unsafe installer state: $INSTALL_STATE"
+fi
 
 if ! getent group printproxy >/dev/null 2>&1; then
     groupadd --system printproxy
@@ -87,11 +147,11 @@ conf_get() {
     ' "$file"
 }
 
-VIP=$(conf_get LISTEN_IP)
+VIP_CSV=$(conf_get LISTEN_IP)
 PREFIX=$(conf_get VIRTUAL_PREFIX)
-PRINTER_IP=$(conf_get PRINTER_IP)
-PRINTER_PORT=$(conf_get PRINTER_PORT)
-LISTEN_PORT=$(conf_get LISTEN_PORT)
+PRINTER_IP_CSV=$(conf_get PRINTER_IP)
+PRINTER_PORT_CSV=$(conf_get PRINTER_PORT)
+LISTEN_PORT_CSV=$(conf_get LISTEN_PORT)
 CONFIG_IFACE=$(conf_get NETWORK_INTERFACE)
 DATA_DIR=$(conf_get DATA_DIR)
 SPOOL_DIR=$(conf_get SPOOL_DIR)
@@ -100,6 +160,36 @@ HMAC_KEY_FILE=$(conf_get HMAC_KEY_FILE)
 ENABLE_FIREWALL=$(conf_get ENABLE_FIREWALL)
 PROTOCOL=$(conf_get PROXY_PROTOCOL)
 DELIVERY_MODE=$(conf_get DELIVERY_MODE)
+
+split_csv() {
+    local value=$1 key=$2 output_name=$3 item
+    local -a raw_items=()
+    local -n output=$output_name
+    IFS=',' read -r -a raw_items <<<"$value"
+    output=()
+    for item in "${raw_items[@]}"; do
+        item=${item#"${item%%[![:space:]]*}"}
+        item=${item%"${item##*[![:space:]]}"}
+        [[ -n $item ]] || die "$key contains an empty CSV entry"
+        output+=("$item")
+    done
+}
+
+declare -a VIPS LISTEN_PORTS PRINTER_IPS PRINTER_PORTS
+split_csv "$VIP_CSV" LISTEN_IP VIPS
+split_csv "$LISTEN_PORT_CSV" LISTEN_PORT LISTEN_PORTS
+split_csv "$PRINTER_IP_CSV" PRINTER_IP PRINTER_IPS
+split_csv "$PRINTER_PORT_CSV" PRINTER_PORT PRINTER_PORTS
+# Persist and compare canonical positional lists, not administrator whitespace.
+VIP_CSV=$(IFS=,; printf '%s' "${VIPS[*]}")
+LISTEN_PORT_CSV=$(IFS=,; printf '%s' "${LISTEN_PORTS[*]}")
+PRINTER_IP_CSV=$(IFS=,; printf '%s' "${PRINTER_IPS[*]}")
+PRINTER_PORT_CSV=$(IFS=,; printf '%s' "${PRINTER_PORTS[*]}")
+PROXY_COUNT=${#VIPS[@]}
+((PROXY_COUNT > 0)) || die 'at least one proxy mapping is required'
+if ((${#LISTEN_PORTS[@]} != PROXY_COUNT || ${#PRINTER_IPS[@]} != PROXY_COUNT || ${#PRINTER_PORTS[@]} != PROXY_COUNT)); then
+    die "proxy CSV length mismatch after validation: LISTEN_IP=$PROXY_COUNT LISTEN_PORT=${#LISTEN_PORTS[@]} PRINTER_IP=${#PRINTER_IPS[@]} PRINTER_PORT=${#PRINTER_PORTS[@]}"
+fi
 
 [[ $PROTOCOL == raw ]] || die 'only PROXY_PROTOCOL=raw is supported safely'
 if [[ -z $DELIVERY_MODE ]]; then
@@ -116,6 +206,24 @@ esac
 for path in "$DATA_DIR" "$SPOOL_DIR" "$LOG_DIR"; do
     [[ $path =~ ^/[A-Za-z0-9._/-]+$ && $path != / ]] || die "unsafe service path: $path"
 done
+
+# Quiesce the only process authorized to write the service-owned trees before
+# inspecting or mutating them. This closes the daemon-vs-installer rename race.
+SERVICE_WAS_ACTIVE=no
+if systemctl is-active --quiet printproxy.service 2>/dev/null; then
+    SERVICE_WAS_ACTIVE=yes
+    log 'Stopping printproxy.service for filesystem and lifecycle validation'
+    systemctl stop printproxy.service
+fi
+systemctl is-active --quiet printproxy.service 2>/dev/null && \
+    die 'printproxy.service did not stop; refusing filesystem validation'
+
+canonical_path() {
+    python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"
+}
+DATA_DIR=$(canonical_path "$DATA_DIR")
+SPOOL_DIR=$(canonical_path "$SPOOL_DIR")
+LOG_DIR=$(canonical_path "$LOG_DIR")
 python3 - "$DATA_DIR" "$SPOOL_DIR" "$LOG_DIR" <<'PY' || die 'service paths must stay in dedicated printproxy trees and may not be symlinks'
 import os, pathlib, sys
 data, spool, log = map(pathlib.Path, sys.argv[1:])
@@ -140,9 +248,101 @@ for index, left in enumerate(paths):
             raise SystemExit(f"service paths overlap: {left} / {right}")
 PY
 
+# A mapping-aware installer state is authoritative: an installed tuple may be
+# reordered and new tuples may be added, but removing/rebinding one requires an
+# explicit uninstall/migration.  Pre-schema-3 state did not persist enough
+# fields, so infer only from bounded operational JSON with the daemon stopped.
+if [[ -r $INSTALL_STATE ]]; then
+    old_listen_port_list=$(conf_get LISTEN_PORT_LIST "$INSTALL_STATE" || true)
+    old_printer_ip_list=$(conf_get PRINTER_IP_LIST "$INSTALL_STATE" || true)
+    old_printer_port_list=$(conf_get PRINTER_PORT_LIST "$INSTALL_STATE" || true)
+    if [[ -z $old_listen_port_list && -z $old_printer_ip_list && -z $old_printer_port_list ]] && \
+       systemctl is-active --quiet printproxy.service 2>/dev/null; then
+        die 'legacy installer state requires a maintenance window: stop printproxy.service, run printproxyctl verify/queue, then rerun so historical endpoints can be inferred safely'
+    fi
+    python3 -I - "$PROJECT_DIR" "$CONFIG_FILE" "$INSTALL_STATE" \
+        /etc/systemd/system/printproxy.service.d/paths.conf <<'PY' || \
+        die 'configured route lifecycle validation failed; preserve every installed tuple or perform explicit uninstall/migration'
+import pathlib
+import sys
+
+project_dir = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(project_dir))
+from printproxy_core import (  # noqa: E402
+    ConfigError,
+    StorageError,
+    load_settings,
+    read_installed_storage_paths,
+    validate_installer_route_lifecycle,
+)
+
+try:
+    settings = load_settings(sys.argv[2])
+    try:
+        legacy_storage_paths = read_installed_storage_paths(pathlib.Path(sys.argv[4]))
+    except (ConfigError, StorageError, OSError):
+        legacy_storage_paths = None
+    validate_installer_route_lifecycle(
+        settings,
+        pathlib.Path(sys.argv[3]),
+        legacy_storage_paths=legacy_storage_paths,
+    )
+except (ConfigError, StorageError, OSError) as exc:
+    print(f"printproxy route lifecycle: {exc}", file=sys.stderr)
+    raise SystemExit(1) from exc
+PY
+fi
+
+# A v2 single-route deployment stored operational state directly at SPOOL_DIR.
+# Switching to N route-scoped stores while that state is live would silently
+# strand a replayable/uncertain job. Require an offline, clean migration first.
+if [[ -r $INSTALL_STATE && $PROXY_COUNT -gt 1 ]]; then
+    old_vip_csv=$(conf_get VIP_LIST "$INSTALL_STATE" || true)
+    [[ -n $old_vip_csv ]] || old_vip_csv=$(conf_get VIP "$INSTALL_STATE" || true)
+    old_vip_count=0
+    [[ -z $old_vip_csv ]] || old_vip_count=$(awk -F, '{print NF}' <<<"$old_vip_csv")
+    if [[ $old_vip_count -eq 1 ]]; then
+        if systemctl is-active --quiet printproxy.service 2>/dev/null; then
+            die 'single-to-multi migration requires a maintenance window: stop printproxy.service, run printproxyctl verify/queue, then rerun the installer'
+        fi
+        python3 -I - "$PROJECT_DIR" "$CONFIG_FILE" "$INSTALL_STATE" <<'PY' || \
+            die 'legacy flat ledger/archive/spool failed authenticated offline verification; restore single-route mode, inspect printproxyctl verify/queue, and resolve it before enabling multiple proxies'
+import pathlib
+import sys
+
+project_dir = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(project_dir))
+from printproxy_core import (  # noqa: E402
+    ConfigError,
+    IntegrityError,
+    StorageError,
+    load_hmac_key,
+    load_settings,
+    validate_single_to_multi_migration,
+)
+
+try:
+    settings = load_settings(sys.argv[2])
+    key = load_hmac_key(settings, cli=True)
+    validate_single_to_multi_migration(settings, pathlib.Path(sys.argv[3]), key)
+except (ConfigError, IntegrityError, StorageError, OSError, ValueError) as exc:
+    print(f"printproxy single-to-multi integrity preflight: {exc}", file=sys.stderr)
+    raise SystemExit(1) from exc
+PY
+    fi
+fi
+
 if [[ $CONFIG_IFACE == auto ]]; then
-    IFACE=$(ip -o route get "$PRINTER_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-    [[ -n $IFACE ]] || die "cannot determine interface used to reach $PRINTER_IP"
+    IFACE=
+    for printer_ip in "${PRINTER_IPS[@]}"; do
+        route_iface=$(ip -o route get "$printer_ip" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+        [[ -n $route_iface ]] || die "cannot determine interface used to reach $printer_ip"
+        if [[ -z $IFACE ]]; then
+            IFACE=$route_iface
+        elif [[ $route_iface != "$IFACE" ]]; then
+            die "configured printers use different route interfaces ($IFACE and $route_iface); this installer manages one print LAN per service"
+        fi
+    done
 else
     IFACE=$CONFIG_IFACE
 fi
@@ -151,20 +351,26 @@ ip link show dev "$IFACE" >/dev/null 2>&1 || die "interface $IFACE does not exis
 [[ $IFACE != lo ]] || die 'refusing to place the LAN service address on loopback'
 log "Detected print LAN interface: $IFACE"
 IP_ADDR_JSON=$(ip -j -4 addr show dev "$IFACE")
-python3 - "$VIP" "$PRINTER_IP" "$IP_ADDR_JSON" <<'PY' || die 'VIP and printer must share one directly connected IPv4 prefix on the selected interface'
+python3 - "$VIP_CSV" "$PRINTER_IP_CSV" "$PREFIX" "$IP_ADDR_JSON" <<'PY' || die 'every VIP/printer pair must share the configured directly connected IPv4 prefix on the selected interface'
 import ipaddress, json, sys
-vip=ipaddress.ip_address(sys.argv[1]); printer=ipaddress.ip_address(sys.argv[2])
-data=json.loads(sys.argv[3])
-matches=[]
+vips=[ipaddress.ip_address(item.strip()) for item in sys.argv[1].split(",")]
+printers=[ipaddress.ip_address(item.strip()) for item in sys.argv[2].split(",")]
+configured_prefix=int(sys.argv[3])
+if len(vips) != len(printers):
+    raise SystemExit("VIP/printer length mismatch")
+data=json.loads(sys.argv[4])
+networks=[]
 for link in data:
     for item in link.get("addr_info", []):
-        if item.get("family") != "inet" or item.get("scope") != "global": continue
-        network=ipaddress.ip_network(f"{item['local']}/{item['prefixlen']}", strict=False)
-        if vip in network and printer in network and vip not in {network.network_address, network.broadcast_address}:
-            matches.append(str(network))
-if len(set(matches)) != 1:
-    raise SystemExit(f"connected-prefix matches: {matches}")
-print(f"Connected print LAN: {matches[0]}")
+        if item.get("family") == "inet" and item.get("scope") == "global":
+            networks.append(ipaddress.ip_network(f"{item['local']}/{item['prefixlen']}", strict=False))
+used=set()
+for index, (vip, printer) in enumerate(zip(vips, printers), 1):
+    matches=[network for network in networks if network.prefixlen == configured_prefix and vip in network and printer in network and vip not in {network.network_address, network.broadcast_address}]
+    if len(set(matches)) != 1:
+        raise SystemExit(f"proxy-{index:03d} {vip}->{printer}: connected-prefix matches: {matches}")
+    used.add(str(matches[0]))
+print(f"Connected print LAN(s): {', '.join(sorted(used))}")
 PY
 
 declare -a managers=()
@@ -191,68 +397,114 @@ if ((${#managers[@]} > 1)); then
 fi
 log 'Persistence uses a dedicated additive oneshot unit; no NetworkManager profile, .network file, or /etc/network/interfaces stanza is rewritten.'
 
-EXISTING_IFACE=$(ip -o -4 addr show | awk -v ip="$VIP" '$4 ~ ("^" ip "/") {print $2; exit}')
-OLD_OWNED=
+declare -A OLD_VIP_OWNERSHIP=()
+declare -a OLD_VIPS=() OLD_OWNERS=() VIP_OWNERS=()
 if [[ -r $INSTALL_STATE ]]; then
-    OLD_OWNED=$(conf_get VIP_OWNED "$INSTALL_STATE" || true)
-    OLD_VIP=$(conf_get VIP "$INSTALL_STATE" || true)
-    [[ -z $OLD_VIP || $OLD_VIP == "$VIP" ]] || die "installed VIP is $OLD_VIP but configuration now requests $VIP; uninstall before changing service identity"
+    OLD_VIP_CSV=$(conf_get VIP_LIST "$INSTALL_STATE" || true)
+    OLD_OWNED_CSV=$(conf_get VIP_OWNED_LIST "$INSTALL_STATE" || true)
+    if [[ -z $OLD_VIP_CSV ]]; then
+        OLD_VIP_CSV=$(conf_get VIP "$INSTALL_STATE" || true)
+        OLD_OWNED_CSV=$(conf_get VIP_OWNED "$INSTALL_STATE" || true)
+    fi
+    if [[ -n $OLD_VIP_CSV ]]; then
+        split_csv "$OLD_VIP_CSV" VIP_LIST OLD_VIPS
+        split_csv "$OLD_OWNED_CSV" VIP_OWNED_LIST OLD_OWNERS
+        ((${#OLD_VIPS[@]} == ${#OLD_OWNERS[@]})) || die 'installer state has mismatched VIP ownership lists'
+        for index in "${!OLD_VIPS[@]}"; do
+            case "${OLD_OWNERS[$index]}" in yes|no) ;; *) die 'installer state has unsafe VIP ownership value' ;; esac
+            OLD_VIP_OWNERSHIP["${OLD_VIPS[$index]}"]=${OLD_OWNERS[$index]}
+        done
+        for old_vip in "${OLD_VIPS[@]}"; do
+            found=no
+            for vip in "${VIPS[@]}"; do
+                [[ $vip == "$old_vip" ]] && found=yes
+            done
+            [[ $found == yes ]] || die "installed VIP $old_vip was removed from configuration; use explicit uninstall/migration so owned addresses are not orphaned"
+        done
+    fi
     OLD_PREFIX=$(conf_get PREFIX "$INSTALL_STATE" || true)
     OLD_IFACE=$(conf_get INTERFACE "$INSTALL_STATE" || true)
     [[ -z $OLD_PREFIX || $OLD_PREFIX == "$PREFIX" ]] || die "installed prefix is /$OLD_PREFIX; explicit uninstall/migration is required"
     [[ -z $OLD_IFACE || $OLD_IFACE == "$IFACE" ]] || die "installed interface is $OLD_IFACE; explicit uninstall/migration is required"
 fi
-if [[ -n $EXISTING_IFACE ]]; then
-    [[ $EXISTING_IFACE == "$IFACE" ]] || die "$VIP already exists on $EXISTING_IFACE, not $IFACE"
-    if [[ $OLD_OWNED == yes ]]; then
-        VIP_OWNED=yes
-        log "$VIP is already present and owned by the prior printproxy installation"
-    else
-        VIP_OWNED=no
-        warn "$VIP pre-existed this installation; uninstall will not remove it"
-    fi
-else
-    if arping -D -q -I "$IFACE" -c 3 -w 3 "$VIP"; then
-        VIP_OWNED=yes
-    else
-        die "duplicate-address detection reports $VIP already in use"
-    fi
-fi
 
-if ss -H -ltn "sport = :$LISTEN_PORT" | grep -q .; then
-    if systemctl is-active --quiet printproxy.service 2>/dev/null; then
-        log "Listener port $LISTEN_PORT belongs to the active printproxy service (idempotent reinstall)"
+for vip in "${VIPS[@]}"; do
+    existing_iface=$(ip -o -4 addr show | awk -v ip="$vip" '$4 ~ ("^" ip "/") {print $2; exit}')
+    old_owned=${OLD_VIP_OWNERSHIP[$vip]:-}
+    if [[ -n $existing_iface ]]; then
+        [[ $existing_iface == "$IFACE" ]] || die "$vip already exists on $existing_iface, not $IFACE"
+        if [[ $old_owned == yes ]]; then
+            VIP_OWNERS+=(yes)
+            log "$vip is already present and owned by the prior printproxy installation"
+        else
+            VIP_OWNERS+=(no)
+            warn "$vip pre-existed this installation; uninstall will not remove it"
+        fi
     else
-        die "TCP port $LISTEN_PORT is already listening; inspect with: ss -lntp"
+        [[ $old_owned != no ]] || die "$vip was recorded as pre-existing but is now missing; refusing to claim it"
+        if [[ $old_owned != yes && $MANAGE_VIPS != yes ]]; then
+            die "$vip is not configured on this host. Add it through the active network manager, or rerun explicitly with --manage-vips"
+        fi
+        if arping -D -q -I "$IFACE" -c 3 -w 3 "$vip"; then
+            VIP_OWNERS+=(yes)
+        else
+            die "duplicate-address detection reports $vip already in use"
+        fi
     fi
+done
+VIP_OWNED_CSV=$(IFS=,; printf '%s' "${VIP_OWNERS[*]}")
+
+if systemctl is-active --quiet printproxy.service 2>/dev/null; then
+    log 'Active printproxy service detected; listener collision check is deferred to the transactional restart'
+else
+    for index in "${!VIPS[@]}"; do
+        vip=${VIPS[$index]}
+        listen_port=${LISTEN_PORTS[$index]}
+        if ss -H -ltn4 "sport = :$listen_port" | awk -v endpoint="$vip:$listen_port" '
+            $4 == endpoint || $4 == "0.0.0.0:" substr(endpoint, index(endpoint, ":") + 1) { found=1 }
+            END { exit !found }
+        '; then
+            die "listener $vip:$listen_port conflicts with an existing socket; inspect with: ss -lntp"
+        fi
+    done
 fi
 
 log "Non-aggressive printer service probe (TCP connect only):"
-PROBE_RESULT=$(python3 - "$PRINTER_IP" <<'PY'
+PROBE_RESULT=$(python3 - "$PRINTER_IP_CSV" "$PRINTER_PORT_CSV" <<'PY'
 import socket, sys
-host=sys.argv[1]
-opened=[]
-for port, name in ((9100,"RAW/JetDirect"),(515,"LPR"),(631,"IPP")):
-    try:
-        with socket.create_connection((host,port),timeout=1.5):
-            print(f"  {port}/tcp {name}: open")
-            opened.append(str(port))
-    except OSError as exc:
-        print(f"  {port}/tcp {name}: closed/unreachable ({exc.__class__.__name__})")
-print("OPEN=" + ",".join(opened))
+hosts=[item.strip() for item in sys.argv[1].split(",")]
+configured_ports=[int(item.strip()) for item in sys.argv[2].split(",")]
+for index, (host, configured_port) in enumerate(zip(hosts, configured_ports), 1):
+    opened=[]
+    print(f"  [proxy-{index:03d}] printer {host}:{configured_port}")
+    probes=[]
+    for port, name in ((configured_port,"configured RAW"),(515,"LPR"),(631,"IPP")):
+        if any(existing_port == port for existing_port, _ in probes):
+            continue
+        probes.append((port, name))
+        try:
+            with socket.create_connection((host,port),timeout=1.5):
+                print(f"    {port}/tcp {name}: open")
+                opened.append(port)
+        except OSError as exc:
+            print(f"    {port}/tcp {name}: closed/unreachable ({exc.__class__.__name__})")
+    print(f"RESULT={index}:{configured_port}:{','.join(map(str, opened))}")
 PY
 )
-printf '%s\n' "$PROBE_RESULT" | grep -v '^OPEN='
-OPEN_PORTS=$(printf '%s\n' "$PROBE_RESULT" | awk -F= '/^OPEN=/{print $2}')
-if [[ ,$OPEN_PORTS, != *,9100,* ]]; then
-    if [[ ,$OPEN_PORTS, == *,515,* || ,$OPEN_PORTS, == *,631,* ]]; then
-        die 'printer exposes LPR/IPP but not RAW 9100. This RAW proxy must not be placed blindly in front of an interactive protocol; see docs/ARCHITECTURE.md.'
+printf '%s\n' "$PROBE_RESULT" | grep -v '^RESULT='
+for index in "${!PRINTER_IPS[@]}"; do
+    printer_ip=${PRINTER_IPS[$index]}
+    printer_port=${PRINTER_PORTS[$index]}
+    result=$(printf '%s\n' "$PROBE_RESULT" | awk -F= -v wanted=$((index + 1)) '$1=="RESULT" {split($2,p,":"); if(p[1]==wanted){print $2; exit}}')
+    opened=${result#*:*:}
+    if [[ ,$opened, != *,$printer_port,* ]]; then
+        if [[ ,$opened, == *,515,* || ,$opened, == *,631,* ]]; then
+            die "printer $printer_ip exposes LPR/IPP but not configured RAW port $printer_port; refusing a blind protocol mismatch"
+        fi
+        warn "Printer $printer_ip:$printer_port is currently unreachable; other mappings remain independently usable"
     fi
-    warn "Printer is currently unreachable on all three tested ports; installation continues for offline recovery, using configured port $PRINTER_PORT"
-fi
-if [[ $PRINTER_PORT != 9100 ]]; then
-    die 'PROXY_PROTOCOL=raw currently requires PRINTER_PORT=9100 after service discovery'
-fi
+    [[ $printer_port == 9100 ]] || die "proxy-$((index + 1)): PROXY_PROTOCOL=raw currently requires PRINTER_PORT=9100"
+done
 
 if id printproxy >/dev/null 2>&1; then
     uid=$(id -u printproxy)
@@ -288,9 +540,31 @@ if [[ ! -r $INSTALL_STATE ]]; then
     done
 fi
 
-install -d -m 0750 -o printproxy -g "$PRINTPROXY_GROUP" "$DATA_DIR" "$SPOOL_DIR" "$LOG_DIR"
-install -d -m 0750 -o printproxy -g "$PRINTPROXY_GROUP" \
-    "$SPOOL_DIR/states" "$SPOOL_DIR/receiving" "$SPOOL_DIR/requests" "$SPOOL_DIR/locks"
+MUTATION_STARTED=yes
+PRINTPROXY_UID=$(id -u printproxy)
+PRINTPROXY_GID=$(id -g printproxy)
+python3 -I - "$PROJECT_DIR" "$DATA_DIR" "$SPOOL_DIR" "$LOG_DIR" \
+    "$PRINTPROXY_UID" "$PRINTPROXY_GID" <<'PY' || \
+    die 'service directory preparation failed; refuse symlinks and inspect every configured storage component'
+import pathlib
+import sys
+
+project_dir = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(project_dir))
+from printproxy_core import StorageError, secure_prepare_service_directories  # noqa: E402
+
+try:
+    secure_prepare_service_directories(
+        pathlib.Path(sys.argv[2]),
+        pathlib.Path(sys.argv[3]),
+        pathlib.Path(sys.argv[4]),
+        uid=int(sys.argv[5]),
+        gid=int(sys.argv[6]),
+    )
+except (OSError, StorageError, ValueError) as exc:
+    print(f"printproxy secure directory preparation: {exc}", file=sys.stderr)
+    raise SystemExit(1) from exc
+PY
 
 require_supported_storage() {
     local path=$1 purpose=$2 filesystem source
@@ -411,13 +685,21 @@ fi
 
 state_tmp=$(mktemp "$CONFIG_DIR/.install-state.XXXXXX")
 {
-    printf 'SCHEMA_VERSION=1\n'
+    printf 'SCHEMA_VERSION=4\n'
     printf 'INSTALLED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%6NZ)"
     printf 'INTERFACE=%s\n' "$IFACE"
     printf 'NETWORK_BACKEND=%s\n' "$NETWORK_BACKEND"
-    printf 'VIP=%s\n' "$VIP"
+    printf 'VIP=%s\n' "${VIPS[0]}"
+    printf 'VIP_LIST=%s\n' "$VIP_CSV"
+    printf 'LISTEN_PORT_LIST=%s\n' "$LISTEN_PORT_CSV"
+    printf 'PRINTER_IP_LIST=%s\n' "$PRINTER_IP_CSV"
+    printf 'PRINTER_PORT_LIST=%s\n' "$PRINTER_PORT_CSV"
+    printf 'DATA_DIR=%s\n' "$DATA_DIR"
+    printf 'SPOOL_DIR=%s\n' "$SPOOL_DIR"
+    printf 'LOG_DIR=%s\n' "$LOG_DIR"
     printf 'PREFIX=%s\n' "$PREFIX"
-    printf 'VIP_OWNED=%s\n' "$VIP_OWNED"
+    printf 'VIP_OWNED=%s\n' "${VIP_OWNERS[0]}"
+    printf 'VIP_OWNED_LIST=%s\n' "$VIP_OWNED_CSV"
     printf 'FIREWALL_OWNED=%s\n' "$FIREWALL_OWNED"
     printf 'BACKUP_DIR=%s\n' "$BACKUP_DIR"
 } >"$state_tmp"
@@ -466,7 +748,11 @@ if ! LOGROTATE_CHECK_OUTPUT=$(logrotate --debug /etc/logrotate.d/printproxy 2>&1
 fi
 systemctl daemon-reload
 systemctl enable printproxy-vip.service printproxy-firewall.service printproxy-vip-watch.timer printproxy.service >/dev/null
-/usr/local/libexec/printproxy-vip up
+VIP_RECEIPT=$(mktemp /run/printproxy-vip-added.XXXXXX)
+PRINTPROXY_VIP_RECEIPT=$VIP_RECEIPT /usr/local/libexec/printproxy-vip up
+mapfile -t VIPS_APPLIED <"$VIP_RECEIPT"
+NETWORK_APPLIED=yes
+rm -f -- "$VIP_RECEIPT"
 systemctl start printproxy-vip.service
 systemctl restart printproxy-firewall.service
 systemctl restart printproxy.service
@@ -481,8 +767,27 @@ fi
 listener_ready=no
 for ((listener_attempt = 1; listener_attempt <= 40; listener_attempt++)); do
     if systemctl is-active --quiet printproxy.service && \
-       ss -H -ltn4 "sport = :$LISTEN_PORT" | \
-           awk -v endpoint="$VIP:$LISTEN_PORT" '$4 == endpoint { found=1 } END { exit !found }'; then
+       python3 - "$VIP_CSV" "$LISTEN_PORT_CSV" <<'PY'
+import pathlib, socket, sys
+vips=[item.strip() for item in sys.argv[1].split(",")]
+ports=[int(item.strip()) for item in sys.argv[2].split(",")]
+if len(vips) != len(ports):
+    raise SystemExit(1)
+try:
+    with pathlib.Path("/proc/net/tcp").open("r", encoding="ascii") as handle:
+        rows=[line.split() for line in handle]
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+listeners={row[1].upper() for row in rows if len(row) >= 4 and row[3] == "0A"}
+for host, port in zip(vips, ports):
+    try:
+        expected=f"{socket.inet_aton(host)[::-1].hex().upper()}:{port:04X}"
+    except OSError:
+        raise SystemExit(1)
+    if expected not in listeners:
+        raise SystemExit(1)
+PY
+    then
         listener_ready=yes
         break
     fi
@@ -490,12 +795,16 @@ for ((listener_attempt = 1; listener_attempt <= 40; listener_attempt++)); do
 done
 if [[ $listener_ready != yes ]]; then
     systemctl --no-pager --full status printproxy.service >&2 || true
-    ss -H -ltn4 "sport = :$LISTEN_PORT" >&2 || true
+    ss -H -ltn4 >&2 || true
     journalctl -u printproxy.service -n 30 --no-pager >&2 || true
-    die 'configured listener socket did not become active within 10 seconds'
+    die 'one or more configured listener sockets did not enter LISTEN within 10 seconds'
 fi
 /usr/local/sbin/printproxyctl status || die 'post-install service/head health check failed'
 systemctl --no-pager --full status printproxy.service
-log "Installed successfully. Listener: $VIP:$LISTEN_PORT -> printer $PRINTER_IP:$PRINTER_PORT"
+log "Installed successfully with $PROXY_COUNT proxy mapping(s):"
+for index in "${!VIPS[@]}"; do
+    log "  proxy-$((index + 1)): ${VIPS[$index]}:${LISTEN_PORTS[$index]} -> ${PRINTER_IPS[$index]}:${PRINTER_PORTS[$index]}"
+done
 log 'Change the management software destination only after printproxyctl self-test succeeds.'
-log "Rollback is immediate: restore the management software destination to $PRINTER_IP:$PRINTER_PORT."
+log 'Rollback is immediate per printer: restore each management-software destination to its corresponding physical printer endpoint.'
+INSTALL_COMMITTED=yes

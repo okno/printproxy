@@ -29,7 +29,7 @@ class TestEnvironment:
                     "PROXY_PROTOCOL=raw",
                     "LISTEN_IP=127.0.0.1",
                     f"LISTEN_PORT={self.listen_port}",
-                    "PRINTER_IP=127.0.0.1",
+                    "PRINTER_IP=127.0.0.2",
                     f"PRINTER_PORT={self.printer_port}",
                     f"DATA_DIR={self.data}",
                     f"SPOOL_DIR={self.spool}",

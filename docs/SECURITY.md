@@ -39,6 +39,8 @@ Se manca, il servizio fallisce senza downgrade silenzioso.
 ## Superficie TCP duplex
 
 - bind esclusivo alla VIP, mai `0.0.0.0`;
+- `ProxyConfig` immutabile per l'intera sessione: listener e stampante non
+  possono essere riassegnati dopo l'accept;
 - ACL IPv4 applicativa prima della lettura;
 - nftables opzionale come difesa in profondità;
 - massimo numero client, byte, durata job e durata sessione;
@@ -108,6 +110,11 @@ produce un flusso senza fine, session duration e timeout sono l'ultima difesa.
 ## File e path
 
 - timestamp e UUID sono generati internamente;
+- in modalità multi, l'IPv4 fisico già validato è l'unico componente usato per
+  derivare le directory DATA/SPOOL; proxy ID e input client non diventano path;
+- ogni route possiede state store, receiving, request queue, lock e ledger
+  separati; il riordino delle liste non sposta uno spool verso un'altra
+  stampante;
 - nomi sidecar devono corrispondere esattamente al nome RAW atteso;
 - path di configurazione devono essere assoluti, dedicati e non sovrapposti;
 - componenti symlink e filesystem non supportati sono rifiutati;
@@ -172,6 +179,11 @@ Misure operative:
 
 `MAX_PRINTER_RESPONSE_CAPTURE_BYTES` riduce l'anteprima JSON ma non elimina il
 rischio privacy: anche pochi byte possono essere sensibili.
+
+L'OCR riceve solo un PGM bounded tramite stdin di un processo Tesseract locale:
+nessuna immagine viene inviata a servizi esterni. I log strutturati conservano
+conteggio, confidence e bounding box, ma non il testo riconosciuto. Il testo
+resta negli artefatti ricevuta soggetti alla stessa ACL/retention del RAW.
 
 ## Retention
 

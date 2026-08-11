@@ -46,13 +46,13 @@ specifico commit, non una revisione non registrata della branch corrente:
 cd /srv/printproxy-src
 git fetch --tags --prune origin
 git tag --list
-RELEASE_REF='v2.0.0'
+RELEASE_REF='v3.0.0'
 git switch --detach "$RELEASE_REF"
 git show --no-patch --decorate --oneline HEAD
 git rev-parse HEAD
 ```
 
-Sostituire `v2.0.0` con il tag pubblicato. Se il tag è firmato e la chiave del
+Sostituire `v3.0.0` con il tag pubblicato. Se il tag è firmato e la chiave del
 maintainer è stata verificata tramite un canale indipendente, controllarlo anche
 con:
 
@@ -74,12 +74,14 @@ modificare il file versionato `config/printproxy.conf`:
 cd /srv/printproxy-src
 getent group printproxy >/dev/null || sudo groupadd --system printproxy
 sudo install -d -m 0750 -o root -g printproxy /etc/printproxy
-sudo install -m 0640 -o root -g printproxy \
-  config/printproxy.conf /etc/printproxy/printproxy.conf
+if ! sudo test -e /etc/printproxy/printproxy.conf; then
+  sudo install -m 0640 -o root -g printproxy \
+    config/printproxy.conf /etc/printproxy/printproxy.conf
+fi
 sudoedit /etc/printproxy/printproxy.conf
 ```
 
-Verificare almeno:
+Per un mapping singolo verificare almeno:
 
 - `LISTEN_IP=10.1.2.220` e `VIRTUAL_PREFIX=24`;
 - `PRINTER_IP=10.1.2.200` e `PRINTER_PORT=9100`;
@@ -88,8 +90,19 @@ Verificare almeno:
 - `ALLOWED_NETWORKS` limitato alla sola rete necessaria;
 - `DATA_DIR`, `SPOOL_DIR` e `LOG_DIR` sui percorsi previsti;
 - `JOB_END_MODE` e `IDLE_TIMEOUT` coerenti con il pilot;
-- `ENABLE_FIREWALL=yes` soltanto dopo avere letto la sezione firewall del
-  `README.md` e verificato l'assenza di UFW/firewalld attivi.
+- `ENABLE_FIREWALL=yes` soltanto dopo avere letto la sezione
+  [Firewall](INSTALLATION.md#firewall) e verificato l'assenza di UFW/firewalld
+  attivi.
+
+Per tre mapping usare invece le quattro liste posizionali, con uguale numero di
+elementi:
+
+```ini
+LISTEN_IP=10.1.2.220,10.1.2.221,10.1.2.222
+LISTEN_PORT=9100,9100,9100
+PRINTER_IP=10.1.2.200,10.1.2.201,10.1.2.202
+PRINTER_PORT=9100,9100,9100
+```
 
 `SPLIT_ON_ESCPOS_CUT` deve restare `no`. Archivio e spool devono risiedere su un
 filesystem Linux locale supportato: ext3/ext4, XFS, Btrfs o ZFS.
@@ -112,18 +125,21 @@ rete se la configurazione non è valida.
 
 ## 4. Installazione
 
-Confermare prima che `10.1.2.220` sia libero e riservato e che il gestionale stia
-ancora stampando direttamente su `10.1.2.200:9100 RAW`. Quindi:
+Confermare prima che tutti i `LISTEN_IP` siano liberi/riservati e che il
+gestionale stia ancora stampando direttamente sugli endpoint fisici. Quindi:
 
 ```bash
 cd /srv/printproxy-src
 chmod +x install.sh uninstall.sh
-sudo ./install.sh
+sudo ./install.sh --manage-vips
 ```
 
 Lo script installa soltanto le dipendenze mancanti, crea l'utente di servizio,
-genera la chiave HMAC, installa il codice sotto `/opt/printproxy`, configura la
-VIP e le unit systemd e avvia il servizio. Se `/etc/printproxy/printproxy.conf`
+genera la chiave HMAC, installa il codice sotto `/opt/printproxy`, configura gli
+IP virtuali esplicitamente autorizzati e le unit systemd e avvia il servizio.
+Omettere `--manage-vips` se gli indirizzi sono già gestiti esternamente: in quel
+caso un IP mancante fa fallire il preflight senza modifiche. Se
+`/etc/printproxy/printproxy.conf`
 esiste già, lo preserva; eventuali nuovi default vengono salvati come
 `/etc/printproxy/printproxy.conf.dist`.
 
@@ -136,9 +152,9 @@ sudo printproxyctl self-test
 sudo printproxyctl test-printer
 systemctl is-active printproxy.service printproxy-vip.service
 systemctl --no-pager --full status printproxy.service
-ss -lntp | grep '10.1.2.220:9100'
-ip -o -4 addr show | grep '10.1.2.220/24'
-ip route get 10.1.2.200
+ss -lntp | grep ':9100'
+ip -o -4 addr show | grep -E '10\.1\.2\.(220|221|222)/24'
+for ip in 10.1.2.200 10.1.2.201 10.1.2.202; do ip route get "$ip"; done
 timedatectl status
 ```
 
@@ -151,19 +167,27 @@ sudo systemctl start printproxy.service
 sudo printproxyctl self-test
 ```
 
-Soltanto dopo il superamento dei controlli modificare il gestionale:
+Soltanto dopo il superamento dei controlli modificare il gestionale, un mapping
+alla volta:
 
 ```text
-Prima:  10.1.2.200:9100 RAW
-Dopo:  10.1.2.220:9100 RAW
+10.1.2.200:9100 -> 10.1.2.220:9100 RAW
+10.1.2.201:9100 -> 10.1.2.221:9100 RAW
+10.1.2.202:9100 -> 10.1.2.222:9100 RAW
 ```
 
 Non cambiare contemporaneamente driver, code page o formato ESC/POS. La stampa
 fisica di prova è deliberatamente separata e richiede conferma esplicita:
 
 ```bash
-sudo printproxyctl test-print --confirm --text "TEST CORTESIA"
+sudo printproxyctl test-print --proxy-id proxy-001 --confirm --text "TEST CORTESIA"
 ```
+
+`test-print` non bypassa le protezioni: usa una connessione locale alla VIP. Se
+l'ACL ammette esclusivamente il gestionale remoto, la prova locale è
+correttamente rifiutata. Usare il gestionale autorizzato oppure, in una finestra
+controllata, aggiungere temporaneamente la VIP della route ad `ALLOWED_CLIENTS`,
+applicare la configurazione, eseguire la prova e ripristinare subito l'ACL.
 
 Verificare poi archivi, coda e log:
 
@@ -179,8 +203,8 @@ Questa modalità è adatta solo se il deploy segue intenzionalmente una branch
 stabile, ad esempio `main`. Per release riproducibili usare invece la procedura a
 tag descritta nella sezione successiva.
 
-1. Bloccare la creazione di nuovi job oppure riportare temporaneamente il
-   gestionale a `10.1.2.200:9100 RAW`.
+1. Bloccare la creazione di nuovi job oppure riportare temporaneamente ogni
+   coda del gestionale alla relativa stampante fisica.
 2. Controllare la coda. Risolvere manualmente eventuali
    `UNKNOWN_PRINT_STATE`; non forzare un retry senza verifica fisica.
 3. Fermare il servizio, verificare l'integrità e creare un backup root-only.
@@ -209,7 +233,7 @@ git show --no-patch --decorate --oneline HEAD
 python3 -m unittest discover -s tests -v
 python3 -m py_compile \
   printproxy.py printproxy_core.py printproxyctl.py receipt_renderer.py
-sudo ./install.sh
+sudo ./install.sh  # aggiungere --manage-vips solo se Printproxy gestisce le VIP
 sudo printproxyctl self-test
 ```
 
@@ -223,8 +247,8 @@ default in `.dist` e crea inoltre il proprio backup dei file installati sotto
 `/var/backups/printproxy/`. Il backup manuale sopra viene eseguito a servizio
 fermo e include anche ledger e spool; proteggerlo come materiale sensibile.
 
-Dopo il deploy rieseguire i controlli della sezione 5. Solo allora rimettere il
-gestionale su `10.1.2.220:9100 RAW`.
+Dopo il deploy rieseguire i controlli della sezione 5. Solo allora rimettere le
+code del gestionale sui rispettivi IP virtuali.
 
 ## 7. Aggiornamento a un nuovo tag
 
@@ -234,11 +258,11 @@ Con il servizio già fermato e il backup già creato come nella sezione preceden
 cd /srv/printproxy-src
 git status --short
 git fetch --tags --prune origin
-NEW_RELEASE_REF='v2.0.0'
+NEW_RELEASE_REF='v3.0.0'
 git switch --detach "$NEW_RELEASE_REF"
 git show --no-patch --decorate --oneline HEAD
 python3 -m unittest discover -s tests -v
-sudo ./install.sh
+sudo ./install.sh  # aggiungere --manage-vips solo se Printproxy gestisce le VIP
 sudo printproxyctl self-test
 ```
 
@@ -252,8 +276,9 @@ git verify-tag "$NEW_RELEASE_REF"
 
 ## 8. Rollback del codice a tag o commit
 
-Il rollback applicativo della stampa è sempre il primo passo: riportare il
-gestionale a `10.1.2.200:9100 RAW`. Poi bloccare nuovi job, fermare il servizio e
+Il rollback applicativo della stampa è sempre il primo passo: riportare ogni
+coda del gestionale alla propria stampante fisica. Poi bloccare nuovi job,
+fermare il servizio e
 conservare un nuovo backup dello stato corrente, anche se l'aggiornamento non è
 riuscito.
 
@@ -271,14 +296,17 @@ git rev-parse HEAD | sudo tee "$ROLLBACK_BACKUP/source.commit" >/dev/null
 
 git status --short
 git fetch --tags --prune origin
-GOOD_REF='v1.0.2'
+GOOD_REF='<TAG_COMPATIBILE_VERIFICATO>'
 git switch --detach "$GOOD_REF"
 git show --no-patch --decorate --oneline HEAD
-sudo ./install.sh
+sudo /usr/bin/python3 -I ./printproxy.py \
+  --config /etc/printproxy/printproxy.conf --check-config
+sudo ./install.sh  # aggiungere --manage-vips solo se Printproxy gestisce le VIP
 sudo printproxyctl self-test
 ```
 
-`GOOD_REF` può essere un tag o l'hash completo di un commit approvato. Non usare
+`GOOD_REF` deve essere un tag o l'hash completo di un commit approvato e
+compatibile con configurazione, schema metadata e spool correnti. Non usare
 `git reset --hard`: il cambio detached conserva la cronologia e fallisce in modo
 visibile se modifiche locali impediscono il checkout.
 
@@ -294,8 +322,8 @@ VIP.
 
 ## 9. Disinstallazione conservativa
 
-Prima di disinstallare, ripristinare nel gestionale la destinazione diretta
-`10.1.2.200:9100 RAW` e confermare che non arrivino nuovi job. Quindi, dal clone
+Prima di disinstallare, ripristinare nel gestionale tutte le destinazioni
+fisiche dirette e confermare che non arrivino nuovi job. Quindi, dal clone
 della stessa release installata:
 
 ```bash
@@ -307,7 +335,7 @@ sudo ./uninstall.sh
 ```
 
 Questa è la modalità predefinita e consigliata: rimuove codice installato, unit,
-VIP posseduta e tabella firewall posseduta, ma conserva archivi, spool,
+VIP possedute e tabella firewall posseduta, ma conserva archivi, spool,
 configurazione e chiave HMAC. L'uninstaller crea inoltre una copia root-only della
 configurazione sotto `/var/backups/printproxy/`.
 
@@ -315,18 +343,19 @@ Controlli finali:
 
 ```bash
 systemctl is-active printproxy.service || true
-ss -lntp | grep '10.1.2.220:9100' || true
-ip -o -4 addr show | grep '10.1.2.220/24' || true
+ss -lntp | grep ':9100' || true
+ip -o -4 addr show | grep -E '10\.1\.2\.(220|221|222)/24' || true
 ```
 
-## 10. Purge esplicito e irreversibile
+## 10. Purge dei percorsi attivi (recovery copy conservata)
 
 Scegliere le opzioni di purge nella **prima** esecuzione dell'uninstaller. Non
 eseguire prima la disinstallazione conservativa e poi una seconda disinstallazione:
 gli helper autenticati possono essere già stati rimossi e lo script può rifiutare
 la seconda operazione in safe mode.
 
-Eliminare la sola configurazione e chiave, conservando archivi e spool:
+Rimuovere la configurazione e la chiave dalla posizione attiva, conservando
+archivi, spool e una recovery copy root-only:
 
 ```bash
 sudo ./uninstall.sh --purge-config
@@ -346,9 +375,14 @@ sudo ./uninstall.sh --purge-config --purge-data --i-understand-data-loss
 ```
 
 `--purge-data` non crea un backup degli archivi e ignora per sicurezza percorsi
-dati personalizzati. Creare e verificare prima un backup esterno. Senza la chiave
-HMAC non sarà più possibile autenticare la storia conservata; per archivi con
-valore operativo o probatorio non usare `--purge-config`.
+dati personalizzati. Creare e verificare prima un backup esterno. L'uninstaller
+crea sempre una recovery copy root-only della configurazione e della chiave e ne
+stampa il percorso; `--purge-config` elimina quindi soltanto la copia attiva in
+`/etc`. Finché la recovery copy esiste, la storia può ancora essere autenticata.
+Per una cancellazione privacy completa occorre inventariare e rimuovere, con
+approvazione esplicita, anche quella directory esatta e ogni backup esterno
+secondo la policy dell'organizzazione. Per archivi con valore operativo o
+probatorio non eliminare l'ultima copia della chiave HMAC.
 
 ## 11. Rimozione del clone Git
 
@@ -392,7 +426,7 @@ seguono esclusivamente le scelte fatte con `uninstall.sh`.
 clone come utente normale
   -> checkout e verifica tag/commit
   -> configurazione in /etc, secret fuori da Git
-  -> sudo ./install.sh
+  -> sudo ./install.sh (con --manage-vips solo se Printproxy gestisce le VIP)
   -> self-test + verify a servizio fermo
   -> pilot
   -> cambio gestionale da .200 a .220
@@ -401,7 +435,7 @@ update
   -> gestionale temporaneamente su .200 / stop nuovi job
   -> stop + verify + backup
   -> git pull --ff-only oppure checkout nuovo tag
-  -> test + sudo ./install.sh + self-test
+  -> test + sudo ./install.sh (flag VIP coerente) + self-test
   -> gestionale nuovamente su .220
 
 remove

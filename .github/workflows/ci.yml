@@ -21,8 +21,11 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
+      - name: Install OCR runtime on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y tesseract-ocr tesseract-ocr-ita
       - name: Install receipt rendering dependencies
-        run: python -m pip install --disable-pip-version-check reportlab pillow
+        run: python -m pip install --disable-pip-version-check reportlab pillow pypdf
       - name: Compile
         run: python -m py_compile printproxy.py printproxy_core.py printproxyctl.py receipt_renderer.py
       - name: Unit and integration tests
@@ -36,8 +39,10 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+      - name: Install OCR runtime
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y tesseract-ocr tesseract-ocr-ita
       - name: Install receipt rendering dependencies
-        run: python -m pip install --disable-pip-version-check reportlab pillow
+        run: python -m pip install --disable-pip-version-check reportlab pillow pypdf
       - name: Validate production command
         run: python -I printproxy.py --config config/printproxy.conf --check-config
       - name: Validate shell syntax

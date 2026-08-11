@@ -25,6 +25,28 @@ Il payload non è decodificato nel percorso di relay. DLE EOT, ASB, ACK
 proprietari, dati server-first e qualsiasi altro byte sono opachi. Parsing,
 testo pulito e PDF lavorano su una copia archiviata dopo il percorso critico.
 
+## Supervisore multi-proxy
+
+`Settings.proxy_configs` contiene route immutabili. Un `MultiProxyService`
+costruisce una `PrintProxyService` per route, ciascuna con listener, lock
+stampante, task, store, ledger e failure domain propri:
+
+```text
+MultiProxyService
+|-- proxy-001: 10.1.2.220:9100 <-> 10.1.2.200:9100
+|-- proxy-002: 10.1.2.221:9100 <-> 10.1.2.201:9100
+`-- proxy-003: 10.1.2.222:9100 <-> 10.1.2.202:9100
+```
+
+Recovery e bind iniziali sono transazionali: se una route non può partire, i
+listener già aperti vengono chiusi. Dopo startup, un guasto stampante/sessione o
+un errore fatale route-scoped non interrompe le route sane. Se tutte falliscono,
+il supervisore termina non-zero.
+
+Archivio e spool multi sono entrambi keyed dall'IPv4 validato della stampante
+fisica. La chiave non cambia riordinando le liste CSV e impedisce che uno stato
+operativo venga riaperto da una route diretta a un'altra stampante.
+
 ## Invarianti
 
 1. Ogni byte client viene scritto su storage durevole prima di poter entrare nel
@@ -165,6 +187,18 @@ I renderer sono limitati da byte, nodi, caratteri, pixel e concorrenza. Scrivono
 file temporanei nella directory di destinazione, fsyncano file e directory su
 POSIX e pubblicano con replace atomico. ReportLab è caricato solo dal sidecar.
 Il RAW non viene mai ricostruito dall'AST.
+
+Le sequenze `ESC *` omogenee da 8/24 dot separate da `ESC J` posizionale
+vengono prima composte in un unico canvas bounded. `ESC *` disegna alla
+posizione corrente ma non avanza la carta: sommare altezza della banda e feed
+separatamente produceva il doppio avanzamento e bande visibili. PDF e OCR usano
+lo stesso raster ricostruito.
+
+Un OCR Tesseract bounded viene tentato soltanto sulle bitmap candidate. Un
+successo sopra soglia crea `RasterTextBlock`: il PDF conserva `source_bitmap`,
+mentre `.PULITO.txt` usa il testo e metadata/log conservano provenienza,
+confidence e bounding box senza loggare il contenuto. Fallimento, timeout o
+bassa confidenza lasciano il placeholder e non cambiano RAW o relay.
 
 ## Integrità
 

@@ -10,14 +10,19 @@ from __future__ import annotations
 import binascii
 import contextlib
 import io
+import math
 import os
 import re
+import shutil
 import struct
+import subprocess
 import tempfile
+import threading
+import unicodedata
 import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import BinaryIO, Callable, Literal, TypeAlias
 
 
 Alignment: TypeAlias = Literal["left", "center", "right"]
@@ -63,9 +68,21 @@ class ReceiptNode:
     """Marker base class for receipt document nodes."""
 
 
+class GraphicBlock(ReceiptNode):
+    """Marker for visual nodes whose source pixels/commands remain authoritative."""
+
+
 @dataclass(frozen=True, slots=True)
 class TextBlock(ReceiptNode):
     text: str
+    style: TextStyle
+
+
+@dataclass(frozen=True, slots=True)
+class SeparatorBlock(ReceiptNode):
+    """A textual horizontal separator represented semantically and losslessly."""
+
+    pattern: str
     style: TextStyle
 
 
@@ -81,7 +98,7 @@ class FeedBlock(ReceiptNode):
 
 
 @dataclass(frozen=True, slots=True)
-class ImageBlock(ReceiptNode):
+class ImageBlock(GraphicBlock):
     """One-bit image, row-major and MSB first (one means black)."""
 
     width: int
@@ -95,6 +112,8 @@ class ImageBlock(ReceiptNode):
     scale_x: int = 1
     scale_y: int = 1
     complete: bool = True
+    strip_count: int = 1
+    strip_feed_dots: tuple[int, ...] = ()
 
     @property
     def row_stride(self) -> int:
@@ -108,7 +127,29 @@ class ImageBlock(ReceiptNode):
 
 
 @dataclass(frozen=True, slots=True)
-class BarcodeBlock(ReceiptNode):
+class OcrTextResult:
+    """Bounded OCR result expressed in source-bitmap coordinates."""
+
+    text: str
+    confidence: float
+    bounding_box: tuple[int, int, int, int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RasterTextBlock(ReceiptNode):
+    """Raster whose semantic text was recovered without replacing its pixels."""
+
+    text: str
+    source_bitmap: ImageBlock
+    ocr_confidence: float
+    bounding_box: tuple[int, int, int, int] | None
+    alignment: Alignment
+    bold_estimate: bool = False
+    font_size_estimate: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BarcodeBlock(GraphicBlock):
     symbology: int
     data: bytes
     alignment: Alignment
@@ -116,7 +157,7 @@ class BarcodeBlock(ReceiptNode):
 
 
 @dataclass(frozen=True, slots=True)
-class QrCodeBlock(ReceiptNode):
+class QrCodeBlock(GraphicBlock):
     data: bytes
     alignment: Alignment
     complete: bool = True
@@ -161,9 +202,11 @@ class UnknownCommandBlock(ReceiptNode):
 
 DocumentNode: TypeAlias = (
     TextBlock
+    | SeparatorBlock
     | LineBreak
     | FeedBlock
     | ImageBlock
+    | RasterTextBlock
     | BarcodeBlock
     | QrCodeBlock
     | InitializeBlock
@@ -467,8 +510,11 @@ class _EscPosParser:
             )
         else:
             packed = _decode_esc_star(width, height, bytes_per_column, payload)
-            dpi_x = 60 if mode in {0, 32} else 120
-            dpi_y = 72 if mode in {0, 1} else 180
+            # ESC/POS bit-image density is defined by the selected mode.  The
+            # horizontal values are 90/180 dpi (not 60/120); the latter made
+            # real 24-dot double-density bands 50% too wide in the PDF.
+            dpi_x = 90 if mode in {0, 32} else 180
+            dpi_y = 60 if mode in {0, 1} else 180
             self.add(
                 ImageBlock(
                     width=width,
@@ -704,6 +750,105 @@ def _decode_esc_star(
     return bytes(packed)
 
 
+def _same_esc_star_strip(left: ImageBlock, right: ImageBlock) -> bool:
+    return (
+        left.source == right.source == "ESC *"
+        and left.width == right.width
+        and left.height == right.height
+        and left.mode == right.mode
+        and left.dpi_x == right.dpi_x
+        and left.dpi_y == right.dpi_y
+        and left.scale_x == right.scale_x
+        and left.scale_y == right.scale_y
+        and left.alignment == right.alignment
+        and left.complete
+        and right.complete
+    )
+
+
+def _is_strip_positioning_feed(feed: FeedBlock, strip: ImageBlock) -> bool:
+    """Recognize the bounded ESC * + ESC J strip-driver pattern.
+
+    ESC * loads a band into the current print line; it does not itself advance
+    the paper.  Drivers commonly follow a 24-dot band with ESC J 24 or ESC J 48
+    before emitting the next equal band.  Treating both the bitmap height and
+    that positioning command as independent PDF flow consumed the distance
+    twice and split a single raster into visible horizontal slices.
+    """
+
+    return (
+        feed.lines == 0
+        and feed.dots in {strip.height, strip.height * 2}
+        and strip.source == "ESC *"
+    )
+
+
+def _combine_esc_star_strips(
+    strips: list[ImageBlock], feeds: list[FeedBlock]
+) -> ImageBlock:
+    first = strips[0]
+    return replace(
+        first,
+        height=sum(strip.height for strip in strips),
+        packed_bits=b"".join(strip.packed_bits for strip in strips),
+        complete=all(strip.complete for strip in strips),
+        strip_count=sum(strip.strip_count for strip in strips),
+        strip_feed_dots=(
+            *(dot for strip in strips for dot in strip.strip_feed_dots),
+            *(feed.dots for feed in feeds),
+        ),
+    )
+
+
+def _reconstruct_esc_star_strips(
+    document: ReceiptDocument, *, max_image_pixels: int
+) -> ReceiptDocument:
+    """Coalesce equal ESC * bands separated only by their positioning feed."""
+
+    source = document.nodes
+    rebuilt: list[DocumentNode] = []
+    index = 0
+    while index < len(source):
+        first = source[index]
+        if not isinstance(first, ImageBlock) or first.source != "ESC *":
+            rebuilt.append(first)
+            index += 1
+            continue
+
+        strips = [first]
+        feeds: list[FeedBlock] = []
+        combined_height = first.height
+        cursor = index
+        while cursor + 2 < len(source):
+            feed = source[cursor + 1]
+            candidate = source[cursor + 2]
+            if not (
+                isinstance(feed, FeedBlock)
+                and isinstance(candidate, ImageBlock)
+                and _is_strip_positioning_feed(feed, strips[-1])
+                and _same_esc_star_strip(strips[-1], candidate)
+            ):
+                break
+            prospective_height = combined_height + candidate.height
+            if first.width * prospective_height > max_image_pixels:
+                break
+            feeds.append(feed)
+            strips.append(candidate)
+            combined_height = prospective_height
+            cursor += 2
+
+        if len(strips) == 1:
+            rebuilt.append(first)
+            index += 1
+            continue
+        rebuilt.append(_combine_esc_star_strips(strips, feeds))
+        index = cursor + 1
+
+    if tuple(rebuilt) == source:
+        return document
+    return replace(document, nodes=tuple(rebuilt))
+
+
 def parse_escpos(
     data: bytes | bytearray | memoryview,
     default_codepage: str = "cp858",
@@ -714,7 +859,11 @@ def parse_escpos(
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TypeError("data must be bytes-like")
     raw = bytes(data)
-    return _EscPosParser(raw, default_codepage, limits or ParseLimits()).parse()
+    active_limits = limits or ParseLimits()
+    document = _EscPosParser(raw, default_codepage, active_limits).parse()
+    return _reconstruct_esc_star_strips(
+        document, max_image_pixels=active_limits.max_image_pixels
+    )
 
 
 @dataclass(slots=True)
@@ -728,6 +877,11 @@ class _CleanLine:
 
 _ITEM_PREFIX = re.compile(r"^\s*(?:\d+\s*[xX]\s+|[-*]\s+)")
 _SEPARATOR = re.compile(r"^\s*[-_=]{3,}\s*$")
+_ITALIAN_WORD_BOUNDARY = re.compile(
+    r"(?:^|\s)(?:a|ai|al|alla|alle|allo|agli|con|da|dal|dalla|dalle|dei|del|della|"
+    r"delle|di|e|in|per|su)$",
+    re.IGNORECASE,
+)
 
 
 def _clean_lines(document: ReceiptDocument) -> list[_CleanLine]:
@@ -766,6 +920,16 @@ def _clean_lines(document: ReceiptDocument) -> list[_CleanLine]:
                 have_style = True
             fragments.append(node.text)
             physical_cells += len(node.text.expandtabs(4)) * node.style.width
+        elif isinstance(node, SeparatorBlock):
+            finish()
+            image_sequence = False
+            lines.append(
+                _CleanLine(
+                    node.pattern,
+                    len(node.pattern) * node.style.width,
+                    node.style.alignment,
+                )
+            )
         elif isinstance(node, LineBreak):
             if image_sequence:
                 continue
@@ -779,6 +943,19 @@ def _clean_lines(document: ReceiptDocument) -> list[_CleanLine]:
                 blanks += max(1, round(node.dots / 24))
             for _ in range(min(blanks, 8)):
                 lines.append(_CleanLine("", 0))
+        elif isinstance(node, RasterTextBlock):
+            finish()
+            image_sequence = False
+            semantic_lines = [line.strip() for line in node.text.splitlines() if line.strip()]
+            for text in semantic_lines:
+                lines.append(
+                    _CleanLine(
+                        text,
+                        len(text),
+                        node.alignment,
+                        placeholder=False,
+                    )
+                )
         elif isinstance(node, ImageBlock):
             finish()
             if not image_sequence:
@@ -826,8 +1003,9 @@ def _unwrap_lines(lines: list[_CleanLine]) -> list[_CleanLine]:
             and not _SEPARATOR.match(previous.text)
         )
         if can_join:
-            previous.text += stripped
-            previous.physical_cells += line.physical_cells - indent
+            separator = " " if _ITALIAN_WORD_BOUNDARY.search(previous.text) else ""
+            previous.text += separator + stripped
+            previous.physical_cells += len(separator) + line.physical_cells - indent
             continue
         result.append(line)
         active_prefix = line.continuation_prefix
@@ -926,6 +1104,14 @@ def _safe_pdf_text(text: str) -> str:
     return text.encode("cp1252", errors="replace").decode("cp1252")
 
 
+def _pdf_character_spacing_width(style: TextStyle) -> float:
+    # PDF Tz scales Tc as well as glyph displacement.  Keep layout metrics in
+    # the same user-space coordinates as the emitted text object so GS ! width
+    # cannot make a line wider than the splitter predicts.
+    horizontal_scale = style.width / style.height
+    return style.char_spacing_dots * 72 / 203 * horizontal_scale
+
+
 def _run_metrics(run: _PdfRun, pdfmetrics: object, base_size: float) -> tuple[float, float]:
     font = "Courier-Bold" if run.style.bold else "Courier"
     font_size = base_size * run.style.height
@@ -933,7 +1119,7 @@ def _run_metrics(run: _PdfRun, pdfmetrics: object, base_size: float) -> tuple[fl
     width = pdfmetrics.stringWidth(text, font, font_size)  # type: ignore[attr-defined]
     width *= run.style.width / run.style.height
     if len(text) > 1 and run.style.char_spacing_dots:
-        width += (len(text) - 1) * run.style.char_spacing_dots * 72 / 203
+        width += (len(text) - 1) * _pdf_character_spacing_width(run.style)
     return width, font_size
 
 
@@ -949,15 +1135,30 @@ def _split_pdf_runs(
         for character in run.text:
             unit = _PdfRun(character, run.style)
             char_width, _ = _run_metrics(unit, pdfmetrics, base_size)
-            if current and current_width + char_width > printable_width:
+            # ESC SP is rendered as PDF character spacing inside each
+            # homogeneous text run.  A one-character metric contains no such
+            # gap, so include the gap that will be introduced when this
+            # character is appended to the preceding run.  Otherwise the
+            # splitter can accept a line that later grows past the printable
+            # width when _run_metrics() measures the merged run.
+            joins_previous_run = bool(current and current[-1].style == run.style)
+            inter_character_width = (
+                _pdf_character_spacing_width(run.style) if joins_previous_run else 0.0
+            )
+            if (
+                current
+                and current_width + inter_character_width + char_width
+                > printable_width
+            ):
                 result.append(current)
                 current = []
                 current_width = 0.0
+                inter_character_width = 0.0
             if current and current[-1].style == run.style:
                 current[-1] = _PdfRun(current[-1].text + character, run.style)
             else:
                 current.append(unit)
-            current_width += char_width
+            current_width += inter_character_width + char_width
     result.append(current)
     return result
 
@@ -993,6 +1194,9 @@ def _pdf_operations(
     for node in document.nodes:
         if isinstance(node, TextBlock):
             pending.append(_PdfRun(node.text, node.style))
+        elif isinstance(node, SeparatorBlock):
+            finish()
+            pending.append(_PdfRun(node.pattern, node.style))
         elif isinstance(node, LineBreak):
             finish(force=True)
         elif isinstance(node, FeedBlock):
@@ -1000,6 +1204,16 @@ def _pdf_operations(
             gap = node.lines * base_size * 1.25 + node.dots * 72 / 203
             if gap > 0:
                 operations.append(_PdfSpacer(min(gap, 200 * 72 / 25.4)))
+        elif isinstance(node, RasterTextBlock):
+            finish()
+            image = node.source_bitmap
+            width = image.width * 72 / max(1, image.dpi_x) * image.scale_x
+            height = image.height * 72 / max(1, image.dpi_y) * image.scale_y
+            if width > printable_width:
+                ratio = printable_width / width
+                width *= ratio
+                height *= ratio
+            operations.append(_PdfImage(image, max(width, 1), max(height, 1)))
         elif isinstance(node, ImageBlock):
             finish()
             width = node.width * 72 / max(1, node.dpi_x) * node.scale_x
@@ -1063,6 +1277,387 @@ def _bitmap_png(image: ImageBlock) -> bytes:
         + _png_chunk(b"IDAT", zlib.compress(bytes(rows), 9))
         + _png_chunk(b"IEND", b"")
     )
+
+
+OcrEngine: TypeAlias = Callable[[ImageBlock], OcrTextResult | None]
+
+
+def _raster_ink_metrics(
+    image: ImageBlock,
+) -> tuple[int, tuple[int, int, int, int] | None, int]:
+    black = 0
+    left = image.width
+    top = image.height
+    right = -1
+    bottom = -1
+    tall_columns = 0
+    for x in range(image.width):
+        column_ink = 0
+        for y in range(image.height):
+            if not image.pixel_is_black(x, y):
+                continue
+            black += 1
+            column_ink += 1
+            left = min(left, x)
+            top = min(top, y)
+            right = max(right, x)
+            bottom = max(bottom, y)
+        if column_ink >= image.height * 0.70:
+            tall_columns += 1
+    bounding_box = None if right < left else (left, top, right + 1, bottom + 1)
+    return black, bounding_box, tall_columns
+
+
+def _is_potential_raster_text(image: ImageBlock) -> bool:
+    pixels = image.width * image.height
+    if (
+        not image.complete
+        or image.width < 16
+        or image.height < 8
+        or pixels > 1_000_000
+    ):
+        return False
+    black, bounding_box, tall_columns = _raster_ink_metrics(image)
+    if bounding_box is None:
+        return False
+    density = black / pixels
+    if not 0.002 <= density <= 0.55:
+        return False
+    aspect = image.width / image.height
+    likely_qr = 0.75 <= aspect <= 1.33 and density >= 0.16
+    likely_barcode = (
+        aspect >= 1.5
+        and tall_columns >= max(8, image.width // 12)
+        and density >= 0.12
+    )
+    return not (likely_qr or likely_barcode)
+
+
+def _bitmap_pgm_for_ocr(image: ImageBlock) -> tuple[bytes, int, int]:
+    """Return a bounded, nearest-neighbour upscaled PGM plus scale/padding."""
+
+    source_pixels = image.width * image.height
+    scale = min(4, max(1, int(math.sqrt(4_000_000 / max(1, source_pixels)))))
+    padding = 4
+    output_width = (image.width + padding * 2) * scale
+    rows = bytearray()
+    white_row = b"\xff" * output_width
+    for _ in range(padding * scale):
+        rows.extend(white_row)
+    side = b"\xff" * (padding * scale)
+    for y in range(image.height):
+        row = bytearray(side)
+        for x in range(image.width):
+            value = b"\x00" if image.pixel_is_black(x, y) else b"\xff"
+            row.extend(value * scale)
+        row.extend(side)
+        for _ in range(scale):
+            rows.extend(row)
+    for _ in range(padding * scale):
+        rows.extend(white_row)
+    output_height = (image.height + padding * 2) * scale
+    header = f"P5\n{output_width} {output_height}\n255\n".encode("ascii")
+    return header + bytes(rows), scale, padding
+
+
+def _normalize_ocr_word(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
+    value = "".join(character for character in value if character.isprintable())
+    return " ".join(value.split())[:256]
+
+
+def _parse_tesseract_tsv(
+    payload: bytes, *, scale: int, padding: int
+) -> OcrTextResult | None:
+    if len(payload) > 1_000_000:
+        return None
+    try:
+        text = payload.decode("utf-8", errors="replace")
+    except UnicodeError:
+        return None
+    grouped: dict[tuple[int, int, int, int], list[str]] = {}
+    confidences: list[tuple[float, int]] = []
+    boxes: list[tuple[int, int, int, int]] = []
+    for row in text.splitlines()[1:]:
+        fields = row.split("\t", 11)
+        if len(fields) != 12:
+            continue
+        try:
+            level = int(fields[0])
+            line_key = tuple(int(fields[index]) for index in (1, 2, 3, 4))
+            left, top, width, height = (int(fields[index]) for index in (6, 7, 8, 9))
+            confidence = float(fields[10])
+        except (TypeError, ValueError):
+            continue
+        word = _normalize_ocr_word(fields[11])
+        if level != 5 or not word or confidence < 0 or not math.isfinite(confidence):
+            continue
+        grouped.setdefault(line_key, []).append(word)
+        confidences.append((min(100.0, confidence), max(1, len(word))))
+        boxes.append((left, top, left + max(0, width), top + max(0, height)))
+    lines = [" ".join(words).strip(" |[]{}") for words in grouped.values()]
+    lines = [line for line in lines if line and any(character.isalnum() for character in line)]
+    if not lines or not confidences:
+        return None
+    normalized = "\n".join(lines)[:2048]
+    weight = sum(item[1] for item in confidences)
+    confidence = sum(score * size for score, size in confidences) / max(1, weight)
+    bounding_box: tuple[int, int, int, int] | None = None
+    if boxes:
+        raw_left = min(box[0] for box in boxes)
+        raw_top = min(box[1] for box in boxes)
+        raw_right = max(box[2] for box in boxes)
+        raw_bottom = max(box[3] for box in boxes)
+        bounding_box = (
+            max(0, math.floor(raw_left / scale) - padding),
+            max(0, math.floor(raw_top / scale) - padding),
+            max(0, math.ceil(raw_right / scale) - padding),
+            max(0, math.ceil(raw_bottom / scale) - padding),
+        )
+    return OcrTextResult(normalized, confidence, bounding_box)
+
+
+@dataclass(frozen=True, slots=True)
+class _BoundedProcessResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+def _run_bounded_process(
+    command: list[str],
+    input_data: bytes,
+    *,
+    timeout: float,
+    stdout_limit: int,
+    stderr_limit: int,
+    creationflags: int = 0,
+) -> _BoundedProcessResult | None:
+    """Run without a shell while bounding both output pipes during execution.
+
+    A temporary input file avoids a third pipe and its associated deadlock
+    surface.  Dedicated readers drain stdout and stderr concurrently, retain at
+    most their configured caps, and kill the child immediately on overflow.
+    ``None`` is the deliberately non-fatal result for timeout, output overflow,
+    reader failure, or incomplete cleanup.
+    """
+
+    if timeout <= 0 or stdout_limit <= 0 or stderr_limit <= 0:
+        raise ValueError("process timeout and output limits must be positive")
+
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    output_limited = threading.Event()
+    reader_failed = threading.Event()
+    timed_out = False
+
+    with tempfile.TemporaryFile() as input_file:
+        input_file.write(input_data)
+        input_file.seek(0)
+        process = subprocess.Popen(
+            command,
+            stdin=input_file,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            creationflags=creationflags,
+        )
+        assert process.stdout is not None
+        assert process.stderr is not None
+
+        def kill_child() -> None:
+            with contextlib.suppress(OSError):
+                process.kill()
+
+        def read_bounded(stream: BinaryIO, target: bytearray, limit: int) -> None:
+            try:
+                # Popen exposes buffered readers. ``read(size)`` may wait for
+                # the entire requested size, delaying overflow detection until
+                # the global timeout; ``read1`` performs one underlying pipe
+                # read and returns as soon as bytes are available.
+                read_chunk = getattr(stream, "read1", stream.read)
+                while True:
+                    chunk = read_chunk(64 * 1024)
+                    if not chunk:
+                        return
+                    remaining = max(0, limit - len(target))
+                    target.extend(chunk[:remaining])
+                    if len(chunk) > remaining:
+                        output_limited.set()
+                        kill_child()
+                        return
+            except (OSError, ValueError):
+                reader_failed.set()
+                kill_child()
+
+        readers = (
+            threading.Thread(
+                target=read_bounded,
+                args=(process.stdout, stdout_buffer, stdout_limit),
+                name="printproxy-ocr-stdout",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=read_bounded,
+                args=(process.stderr, stderr_buffer, stderr_limit),
+                name="printproxy-ocr-stderr",
+                daemon=True,
+            ),
+        )
+        for reader in readers:
+            reader.start()
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            kill_child()
+            try:
+                returncode = process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                reader_failed.set()
+                returncode = -1
+        finally:
+            if process.poll() is None:
+                kill_child()
+                with contextlib.suppress(OSError, subprocess.SubprocessError):
+                    process.wait(timeout=1.0)
+            for reader in readers:
+                reader.join(timeout=1.0)
+            process.stdout.close()
+            process.stderr.close()
+            for reader in readers:
+                if reader.is_alive():
+                    reader.join(timeout=1.0)
+
+    if timed_out or output_limited.is_set() or reader_failed.is_set():
+        return None
+    if any(reader.is_alive() for reader in readers):
+        return None
+    return _BoundedProcessResult(returncode, bytes(stdout_buffer), bytes(stderr_buffer))
+
+
+def _run_tesseract_ocr(image: ImageBlock) -> OcrTextResult | None:
+    executable = shutil.which("tesseract")
+    if executable is None:
+        return None
+    language = os.environ.get("PRINTPROXY_OCR_LANG", "ita+eng")
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]{1,64}", language):
+        language = "ita+eng"
+    pgm, scale, padding = _bitmap_pgm_for_ocr(image)
+    command = [
+        executable,
+        "stdin",
+        "stdout",
+        "--dpi",
+        str(max(image.dpi_x, image.dpi_y, 72) * scale),
+        "--psm",
+        "6",
+        "-l",
+        language,
+        "tsv",
+    ]
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        completed = _run_bounded_process(
+            command,
+            pgm,
+            timeout=5.0,
+            stdout_limit=1_000_000,
+            stderr_limit=64 * 1024,
+            creationflags=creation_flags,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed is None or completed.returncode != 0:
+        return None
+    return _parse_tesseract_tsv(completed.stdout, scale=scale, padding=padding)
+
+
+def recognize_raster_text(
+    document: ReceiptDocument,
+    *,
+    ocr_engine: OcrEngine | None = None,
+    minimum_confidence: float = 70.0,
+    max_images: int = 4,
+    max_total_pixels: int = 4_000_000,
+) -> ReceiptDocument:
+    """Replace only high-confidence textual rasters with semantic AST nodes.
+
+    The original :class:`ImageBlock` is retained inside every
+    :class:`RasterTextBlock`; PDF rendering therefore remains pixel-faithful.
+    Missing OCR support, low confidence, timeouts, and backend failures all
+    degrade safely to the original image node.
+    """
+
+    if not 0 <= minimum_confidence <= 100:
+        raise ValueError("minimum_confidence must be between 0 and 100")
+    if max_images < 0:
+        raise ValueError("max_images must be non-negative")
+    if max_total_pixels < 0:
+        raise ValueError("max_total_pixels must be non-negative")
+    engine = ocr_engine or _run_tesseract_ocr
+    nodes: list[DocumentNode] = []
+    warnings = list(document.warnings)
+    attempted_images = 0
+    attempted_pixels = 0
+    for node in document.nodes:
+        if not isinstance(node, ImageBlock) or not _is_potential_raster_text(node):
+            nodes.append(node)
+            continue
+        pixels = node.width * node.height
+        if attempted_images >= max_images or attempted_pixels + pixels > max_total_pixels:
+            nodes.append(node)
+            continue
+        attempted_images += 1
+        attempted_pixels += pixels
+        try:
+            result = engine(node)
+        except Exception as error:
+            if len(warnings) < 64:
+                warnings.append(f"raster OCR failed safely: {_safe_error(error, 160)}")
+            nodes.append(node)
+            continue
+        if (
+            result is None
+            or not isinstance(result, OcrTextResult)
+            or not math.isfinite(result.confidence)
+            or result.confidence < minimum_confidence
+        ):
+            nodes.append(node)
+            continue
+        normalized = "\n".join(
+            line.strip()
+            for line in unicodedata.normalize("NFKC", result.text).splitlines()
+            if line.strip()
+        )[:2048]
+        if not normalized or not any(character.isalnum() for character in normalized):
+            nodes.append(node)
+            continue
+        bbox = result.bounding_box
+        if bbox is not None:
+            left, top, right, bottom = bbox
+            bbox = (
+                max(0, min(node.width, left)),
+                max(0, min(node.height, top)),
+                max(0, min(node.width, right)),
+                max(0, min(node.height, bottom)),
+            )
+            if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+                bbox = None
+        line_count = max(1, normalized.count("\n") + 1)
+        font_size = None if bbox is None else (bbox[3] - bbox[1]) / line_count
+        nodes.append(
+            RasterTextBlock(
+                text=normalized,
+                source_bitmap=node,
+                ocr_confidence=result.confidence,
+                bounding_box=bbox,
+                alignment=node.alignment,
+                bold_estimate=False,
+                font_size_estimate=font_size,
+            )
+        )
+    return replace(document, nodes=tuple(nodes), warnings=tuple(warnings))
 
 
 def _safe_error(error: BaseException, limit: int = 500) -> str:
@@ -1147,7 +1742,12 @@ def render_pdf(
         marker_height = base_font_size * 1.5
         for operation in operations:
             reserve = marker_height if content_truncated else 0.0
-            if used_height + operation.height > max(0.0, available_height - reserve):
+            # The page height is derived from this same sum; tolerate sub-point
+            # floating error so an exact-fit final operation is not replaced by
+            # a false truncation marker.
+            if used_height + operation.height > max(
+                0.0, available_height - reserve
+            ) + 1e-7:
                 content_truncated = True
                 break
             selected.append(operation)
@@ -1294,6 +1894,11 @@ def render_receipt_artifacts(
     default_codepage: str = "cp858",
     limits: ParseLimits | None = None,
     pdf_width_mm: float = 80.0,
+    ocr_enabled: bool = True,
+    ocr_engine: OcrEngine | None = None,
+    ocr_minimum_confidence: float = 70.0,
+    ocr_max_images: int = 4,
+    ocr_max_total_pixels: int = 4_000_000,
     best_effort: bool = True,
 ) -> ReceiptArtifactsResult:
     """Parse once and render clean text/PDF from the same document model.
@@ -1303,6 +1908,14 @@ def render_receipt_artifacts(
     """
 
     document = parse_escpos(data, default_codepage, limits)
+    if ocr_enabled:
+        document = recognize_raster_text(
+            document,
+            ocr_engine=ocr_engine,
+            minimum_confidence=ocr_minimum_confidence,
+            max_images=ocr_max_images,
+            max_total_pixels=ocr_max_total_pixels,
+        )
     clean_text = render_clean_text(document)
     clean_destination = Path(clean_text_path) if clean_text_path is not None else None
     clean_error: str | None = None
@@ -1332,13 +1945,17 @@ __all__ = [
     "CashDrawerBlock",
     "CutBlock",
     "FeedBlock",
+    "GraphicBlock",
     "ImageBlock",
     "InitializeBlock",
     "LineBreak",
+    "OcrTextResult",
     "ParseLimits",
     "PdfRenderResult",
     "QrCodeBlock",
+    "RasterTextBlock",
     "RealtimeStatusBlock",
+    "SeparatorBlock",
     "ReceiptArtifactsResult",
     "ReceiptDocument",
     "StateChangeBlock",
@@ -1346,6 +1963,7 @@ __all__ = [
     "TextStyle",
     "UnknownCommandBlock",
     "parse_escpos",
+    "recognize_raster_text",
     "render_clean_text",
     "render_pdf",
     "render_receipt_artifacts",

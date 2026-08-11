@@ -127,9 +127,16 @@ Il parser gestisce le modalità classiche `m=0,1,32,33`:
 - payload: uno o tre byte verticali per colonna;
 - output AST: bitmap 1-bit row-major, MSB-first.
 
-Il PDF incorpora la bitmap decodificata. Più slice separate da feed conservano
-spaziatura e ordine; il testo pulito le può rappresentare come un'unica regione
-`[IMMAGINE]` quando sono consecutive.
+`ESC *` disegna una banda alla posizione corrente ma non avanza da solo la
+carta. I driver POS usano frequentemente `ESC J 24`/`ESC J 48` per posizionare
+la banda omogenea successiva. Il parser riconosce questa sequenza bounded e
+concatena le bitmap row-major in un solo canvas; non somma una seconda volta
+l'altezza già rappresentata dal feed. Il PDF incorpora il canvas completo.
+
+Quando la regione è una candidata testuale, l'OCR viene applicato soltanto dopo
+questa ricostruzione. Un risultato affidabile produce `RasterTextBlock` per il
+testo pulito, ma il PDF continua a usare i pixel originali. Bitmap grafiche,
+OCR assente/fallito o risultati sotto soglia mantengono il placeholder esplicito.
 
 ## Raster `GS v 0`
 

@@ -53,17 +53,22 @@ ReceiptDocument
   +-- InitializeBlock
   +-- StateChangeBlock
   +-- TextBlock(text, TextStyle)
+  +-- SeparatorBlock(pattern, TextStyle)
   +-- LineBreak
   +-- FeedBlock(lines, dots)
-  +-- ImageBlock(width, height, packed_bits, density, alignment)
-  +-- BarcodeBlock
-  +-- QrCodeBlock
+  +-- GraphicBlock
+      +-- ImageBlock(width, height, packed_bits, density, alignment)
+      +-- BarcodeBlock
+      +-- QrCodeBlock
+  +-- RasterTextBlock(text, source_bitmap, confidence, bounding_box)
   +-- CutBlock
   +-- CashDrawerBlock
   +-- RealtimeStatusBlock
   +-- UnknownCommandBlock
 ```
 
+`GraphicBlock` è la base tipizzata dei nodi visivi e `SeparatorBlock` permette
+di rappresentare una linea divisoria senza confonderla con un comando tecnico.
 `TextStyle` conserva bold, underline, fattori width/height, alignment, font,
 line spacing e character spacing. I cambi stile vengono applicati solo ai nodi
 testo successivi.
@@ -92,7 +97,8 @@ Il renderer pulito:
 
 - esclude tag tecnici, cut, drawer, status e unknown;
 - conserva testo, righe, feed e allineamento significativo;
-- rappresenta raster consecutivi come `[IMMAGINE]`;
+- usa il testo di `RasterTextBlock` quando il raster ricostruito supera la
+  soglia OCR, conservando `[IMMAGINE]` per una regione non riconosciuta;
 - rappresenta QR e barcode con placeholder espliciti;
 - decodifica CP858 e i cambi `ESC t` supportati;
 - limita output e numero di righe vuote generate dai feed.
@@ -100,16 +106,16 @@ Il renderer pulito:
 Esempio:
 
 ```text
-Operatore: 10/08/26  23:45
+Demo: 01/01/00  00:00
 
-                [IMMAGINE]
+                Tavolo: 25-5
 
-Portata: 1
+Sezione: A
 --------------------------
 
-1x Acqua frizzante piccola
+1x Articolo dimostrativo
 
-   Coperti: 1
+   Persone: 2
 ```
 
 ### Unwrap conservativo
@@ -117,9 +123,9 @@ Portata: 1
 Una stampante o il gestionale può spezzare un articolo così:
 
 ```text
-1x Acqua friz
-   zante picc
-   ola
+1x Articolo d
+   imostrativ
+   o
 ```
 
 Le righe vengono unite senza spazio soltanto quando tutti i segnali sono forti:
@@ -130,7 +136,7 @@ Le righe vengono unite senza spazio soltanto quando tutti i segnali sono forti:
 4. la riga originale precedente raggiunge quasi la larghezza fisica osservata;
 5. non è un separatore, placeholder o riga vuota.
 
-Il risultato è `1x Acqua frizzante piccola`. Una riga indentata ambigua senza
+Il risultato è `1x Articolo dimostrativo`. Una riga indentata ambigua senza
 questi segnali resta separata. L'euristica privilegia falsi negativi rispetto a
 fusioni semanticamente errate.
 
@@ -142,6 +148,17 @@ Le modalità 8-dot e 24-dot sono convertite da colonne verticali alla bitmap
 1-bit row-major dell'AST. Densità orizzontale e verticale determinano la scala
 fisica iniziale del PDF.
 
+Una sequenza omogenea:
+
+```text
+ESC * band 1 -> ESC J 24/48 -> ESC * band 2 -> ...
+```
+
+viene ricostruita come un unico `ImageBlock`. Il feed interno è posizionamento
+della testina/carta tra strip: `ESC *` non ha già fatto avanzare la carta. Il
+vecchio renderer sommava sia l'altezza della bitmap sia il feed e separava le
+strip con gap visibili.
+
 ### GS `v 0`
 
 Il payload row-major viene mantenuto packed; normal, double-width,
@@ -149,11 +166,49 @@ double-height e quadruple impostano fattori di scala. L'immagine viene ridotta
 proporzionalmente solo se supera l'area stampabile.
 
 Il PDF costruisce in memoria un PNG monocromatico standard e lo passa a
-ReportLab. Non usa OCR e non sostituisce il raster con il testo eventualmente
-visibile nell'immagine.
+ReportLab. Anche quando esiste un `RasterTextBlock`, usa sempre la sua
+`source_bitmap`: l'OCR non sostituisce la grafica nel PDF.
 
 Immagini incomplete vengono marcate `complete=false`; parti mancanti restano
 bianche solo nella vista best-effort. Il RAW indica l'esatta incompletezza.
+
+## OCR testuale bounded
+
+L'OCR è un fallback semantico, non una correzione del layout:
+
+```text
+bitmap ESC/POS completa
+  -> classificazione candidata testuale
+  -> PGM con padding/upscale limitati
+  -> tesseract ita+eng, TSV, timeout 5 s
+  -> normalizzazione Unicode/righe
+  -> confidence >= 70
+  -> RasterTextBlock
+```
+
+Sono processate al massimo quattro immagini e quattro milioni di pixel. Il
+subprocess non usa shell, riceve i pixel su stdin e produce un risultato
+limitato. Nei log viene registrato `OCR_RASTER_TEXT` con numero blocchi,
+confidence e bounding box, mai il testo della comanda. Se Tesseract, i dati
+lingua o la confidenza mancano, l'`ImageBlock` resta immutato e il pulito mostra
+`[IMMAGINE]`; RAW e PDF non falliscono.
+
+Debian usa `tesseract-ocr` e `tesseract-ocr-ita`. La lingua di default è
+`ita+eng`. `PRINTPROXY_OCR_LANG` è una variabile d'ambiente del processo, non
+una chiave di `printproxy.conf`. Per un override persistente usare un drop-in:
+
+```bash
+sudo systemctl edit printproxy.service
+```
+
+```ini
+[Service]
+Environment="PRINTPROXY_OCR_LANG=ita+eng"
+```
+
+Quindi eseguire `sudo systemctl daemon-reload` e riavviare il servizio in una
+finestra senza sessioni attive. Il valore deve riferirsi soltanto a language
+pack Tesseract già installati e verificati con `tesseract --list-langs`.
 
 ## PDF termico
 
@@ -257,9 +312,28 @@ La verifica visuale di un PDF sintetico non dimostra equivalenza hardware. La
 campagna POS80BL deve includere ricevute reali con bitmap 24-dot, raster, testo
 double-size, CP858, QR/barcode, cut e DLE EOT.
 
+### Regressione delle quattro bande
+
+L'ispezione locale del PDF problematico mostrava quattro XObject lossless
+`312x24`. Ogni banda era disegnata alta 9,6 pt, ma le ordinate differivano di
+26,6247 pt: 9,6 pt di immagine più circa 17,024 pt, un pattern compatibile con
+il doppio avanzamento osservato nella sequenza `BIT_IMAGE` / `FEED_DOTS 48`.
+Ricomponendo i pixel senza contare nuovamente quel posizionamento si ottiene un
+solo raster `312x96`, con rettangolo e testo completi. Il valore osservabile nel
+PDF di produzione non viene trascritto nel repository pubblico e differiva
+dalla stringa sintetica `25-5`; il RAW originale non era disponibile, quindi
+l'associazione all'esatto comando ESC/POS resta un'inferenza e richiede una
+nuova cattura RAW per essere confermata.
+
+Il PDF di produzione e i suoi pixel non vengono pubblicati nel repository. I
+test usano esclusivamente una fixture ESC/POS sintetica e priva di dati reali,
+`Tavolo: 25-5`, con lo stesso schema quattro bande / tre feed. La fixture rende
+riproducibili PDF e `.PULITO.txt`, ma non viene presentata come cattura POS80BL.
+
 ## Limiti noti
 
-- nessun OCR delle immagini;
+- OCR limitato a Tesseract e bitmap candidate; il fallback può restare
+  `[IMMAGINE]` con grafica non testuale o confidenza insufficiente;
 - nessuna garanzia di scansionabilità QR/barcode;
 - unknown/vendor command non riprodotti visivamente;
 - caratteri fuori WinAnsi possono diventare `?` nel font PDF built-in;

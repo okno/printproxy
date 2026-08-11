@@ -19,7 +19,7 @@ import shutil
 import stat
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -216,13 +216,60 @@ def _split_csv(value: str) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
-class Settings:
-    config_path: Path
-    proxy_protocol: str
+class ProxyConfig:
+    """One immutable listener-to-printer route.
+
+    Addresses are canonical IPv4 strings.  That invariant is also what makes
+    ``printer_directory_name`` safe to append to the configured archive root:
+    it can contain only decimal digits and dots, never path separators.
+    """
+
+    proxy_id: str
     listen_ip: str
     listen_port: int
     printer_ip: str
     printer_port: int
+
+    def __post_init__(self) -> None:
+        if (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", self.proxy_id)
+            or self.proxy_id in {".", ".."}
+        ):
+            raise ConfigError(f"unsafe proxy identifier: {self.proxy_id!r}")
+        try:
+            listen = ipaddress.IPv4Address(self.listen_ip)
+            printer = ipaddress.IPv4Address(self.printer_ip)
+        except ipaddress.AddressValueError as exc:
+            raise ConfigError(f"invalid IPv4 proxy route: {exc}") from exc
+        for key, value in (
+            ("listen_port", self.listen_port),
+            ("printer_port", self.printer_port),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+                raise ConfigError(f"{key}: expected 1..65535, got {value!r}")
+        object.__setattr__(self, "listen_ip", str(listen))
+        object.__setattr__(self, "printer_ip", str(printer))
+
+    @property
+    def printer_directory_name(self) -> str:
+        """Return the validated physical-printer IP used as archive dirname."""
+
+        return self.printer_ip
+
+    @property
+    def listen_endpoint(self) -> tuple[str, int]:
+        return self.listen_ip, self.listen_port
+
+    @property
+    def printer_endpoint(self) -> tuple[str, int]:
+        return self.printer_ip, self.printer_port
+
+
+@dataclass(frozen=True)
+class Settings:
+    config_path: Path
+    proxy_protocol: str
+    proxy_configs: tuple[ProxyConfig, ...]
     data_dir: Path
     spool_dir: Path
     log_dir: Path
@@ -276,6 +323,54 @@ class Settings:
     network_interface: str
     virtual_prefix: int
     enable_firewall: bool
+    route_scoped: bool
+
+    @property
+    def primary_proxy(self) -> ProxyConfig:
+        """Return the first route for source compatibility with v2 callers."""
+
+        return self.proxy_configs[0]
+
+    @property
+    def listen_ip(self) -> str:
+        return self.primary_proxy.listen_ip
+
+    @property
+    def listen_port(self) -> int:
+        return self.primary_proxy.listen_port
+
+    @property
+    def printer_ip(self) -> str:
+        return self.primary_proxy.printer_ip
+
+    @property
+    def printer_port(self) -> int:
+        return self.primary_proxy.printer_port
+
+    def for_proxy(self, proxy: ProxyConfig) -> Settings:
+        """Return settings scoped to exactly one immutable proxy route.
+
+        A one-route deployment keeps the historic flat DATA_DIR/SPOOL_DIR
+        layout so existing manifests, HMAC chains and crash-recovery states
+        remain visible after an upgrade.  In a multi-route deployment each
+        physical printer gets its own archive/HMAC chain and operational
+        spool.  Both use the validated printer IP as a stable identity, so
+        reordering positional CSV mappings cannot attach old state to another
+        destination.  Duplicate printer IPs are rejected by the parser.
+        Existing flat history remains untouched at the configured roots.
+        """
+
+        if proxy not in self.proxy_configs:
+            raise ConfigError(f"proxy route is not part of these settings: {proxy.proxy_id}")
+        if len(self.proxy_configs) == 1:
+            return self
+        return replace(
+            self,
+            proxy_configs=(proxy,),
+            data_dir=self.data_dir / proxy.printer_directory_name,
+            spool_dir=self.spool_dir / proxy.printer_directory_name,
+            route_scoped=True,
+        )
 
     @property
     def states_dir(self) -> Path:
@@ -409,24 +504,113 @@ def read_config_file(path: Path) -> dict[str, str]:
     return values
 
 
+_PROXY_ARRAY_KEYS = ("LISTEN_IP", "LISTEN_PORT", "PRINTER_IP", "PRINTER_PORT")
+
+
+def _required_proxy_csv(value: str, key: str) -> tuple[str, ...]:
+    """Split a required proxy array without silently discarding empty slots."""
+
+    entries = tuple(item.strip() for item in value.split(","))
+    for index, entry in enumerate(entries, 1):
+        if not entry:
+            raise ConfigError(
+                f"{key}: entry {index} is empty; proxy arrays must not contain empty entries"
+            )
+    return entries
+
+
+def _proxy_ipv4(value: str, key: str, index: int) -> str:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ConfigError(f"{key}[{index}]: invalid IP address {value!r}: {exc}") from exc
+    if address.version != 4:
+        raise ConfigError(f"{key}[{index}]: this release supports only IPv4 addresses")
+    return str(address)
+
+
+def parse_proxy_configs(raw: Mapping[str, str]) -> tuple[ProxyConfig, ...]:
+    """Parse and validate positional CSV proxy arrays.
+
+    The public configuration format intentionally remains the four historical
+    keys.  A scalar value is therefore just a one-element array, while commas
+    opt into N independent routes correlated strictly by index.
+    """
+
+    arrays = {key: _required_proxy_csv(raw[key], key) for key in _PROXY_ARRAY_KEYS}
+    counts = {key: len(entries) for key, entries in arrays.items()}
+    if len(set(counts.values())) != 1:
+        detail = "; ".join(f"{key} contains {counts[key]} entries" for key in _PROXY_ARRAY_KEYS)
+        raise ConfigError(
+            f"proxy configuration array length mismatch: {detail}. "
+            "All proxy configuration arrays must have the same number of entries."
+        )
+
+    proxies: list[ProxyConfig] = []
+    listen_endpoints: dict[tuple[str, int], str] = {}
+    listen_ips: dict[str, list[str]] = {}
+    printer_ips: dict[str, str] = {}
+    for offset in range(counts["LISTEN_IP"]):
+        display_index = offset + 1
+        listen_ip = _proxy_ipv4(arrays["LISTEN_IP"][offset], "LISTEN_IP", display_index)
+        printer_ip = _proxy_ipv4(arrays["PRINTER_IP"][offset], "PRINTER_IP", display_index)
+        listen_port = parse_int(
+            arrays["LISTEN_PORT"][offset], f"LISTEN_PORT[{display_index}]", 1, 65535
+        )
+        printer_port = parse_int(
+            arrays["PRINTER_PORT"][offset], f"PRINTER_PORT[{display_index}]", 1, 65535
+        )
+        proxy_id = f"proxy-{display_index:03d}"
+        if listen_ip == "0.0.0.0":
+            raise ConfigError(
+                f"LISTEN_IP[{display_index}]=0.0.0.0 is forbidden; bind a dedicated address"
+            )
+        if (listen_ip, listen_port) == (printer_ip, printer_port):
+            raise ConfigError(
+                f"{proxy_id}: listener and printer destination must not be identical"
+            )
+        listen_endpoint = (listen_ip, listen_port)
+        if previous := listen_endpoints.get(listen_endpoint):
+            raise ConfigError(
+                f"duplicate listener endpoint {listen_ip}:{listen_port} "
+                f"in {previous} and {proxy_id}"
+            )
+        if previous := printer_ips.get(printer_ip):
+            raise ConfigError(
+                f"duplicate PRINTER_IP {printer_ip} in {previous} and {proxy_id}; "
+                "jobs are partitioned by physical-printer IP"
+            )
+        listen_endpoints[listen_endpoint] = proxy_id
+        listen_ips.setdefault(listen_ip, []).append(proxy_id)
+        printer_ips[printer_ip] = proxy_id
+        proxies.append(
+            ProxyConfig(
+                proxy_id=proxy_id,
+                listen_ip=listen_ip,
+                listen_port=listen_port,
+                printer_ip=printer_ip,
+                printer_port=printer_port,
+            )
+        )
+
+    overlapping_ips = sorted(set(listen_ips) & set(printer_ips))
+    if overlapping_ips:
+        overlap = overlapping_ips[0]
+        listener_routes = ", ".join(listen_ips[overlap])
+        raise ConfigError(
+            f"unsafe proxy route graph: PRINTER_IP {overlap} in {printer_ips[overlap]} "
+            f"is also configured as LISTEN_IP in {listener_routes}; "
+            "a physical-printer destination must not target any configured listener IP"
+        )
+    return tuple(proxies)
+
+
 def load_settings(path: str | os.PathLike[str]) -> Settings:
     config_path = Path(path)
     raw = dict(DEFAULTS)
     raw.update(read_config_file(config_path))
 
-    try:
-        listen = ipaddress.ip_address(raw["LISTEN_IP"])
-        printer = ipaddress.ip_address(raw["PRINTER_IP"])
-    except ValueError as exc:
-        raise ConfigError(f"invalid listener/printer IP: {exc}") from exc
-    if listen.version != 4 or printer.version != 4:
-        raise ConfigError("this release supports IPv4 listener and printer addresses")
-    listen_port = parse_int(raw["LISTEN_PORT"], "LISTEN_PORT", 1, 65535)
-    printer_port = parse_int(raw["PRINTER_PORT"], "PRINTER_PORT", 1, 65535)
-    if listen == printer and listen_port == printer_port:
-        raise ConfigError("listener and printer destination must not be identical")
-    if str(listen) == "0.0.0.0":
-        raise ConfigError("LISTEN_IP=0.0.0.0 is forbidden; bind the dedicated address")
+    proxy_configs = parse_proxy_configs(raw)
     if raw["HASH_ALGORITHM"].lower() != "sha256":
         raise ConfigError("only HASH_ALGORITHM=sha256 is supported")
     if not parse_bool(raw["ENABLE_HASH_CHAIN"], "ENABLE_HASH_CHAIN"):
@@ -475,10 +659,7 @@ def load_settings(path: str | os.PathLike[str]) -> Settings:
     return Settings(
         config_path=config_path,
         proxy_protocol="raw",
-        listen_ip=str(listen),
-        listen_port=listen_port,
-        printer_ip=str(printer),
-        printer_port=printer_port,
+        proxy_configs=proxy_configs,
         data_dir=data_dir,
         spool_dir=spool_dir,
         log_dir=log_dir,
@@ -547,6 +728,7 @@ def load_settings(path: str | os.PathLike[str]) -> Settings:
         network_interface=raw["NETWORK_INTERFACE"],
         virtual_prefix=parse_int(raw["VIRTUAL_PREFIX"], "VIRTUAL_PREFIX", 1, 32),
         enable_firewall=parse_bool(raw["ENABLE_FIREWALL"], "ENABLE_FIREWALL"),
+        route_scoped=False,
     )
 
 
@@ -561,17 +743,172 @@ def validate_directory(path: Path, *, create: bool = False, mode: int = 0o750) -
         raise StorageError(f"expected real directory, not symlink: {path}")
 
 
+_INSTALLER_SPOOL_DIRECTORIES = ("states", "receiving", "requests", "locks")
+
+
+def _installer_directory_flags() -> int:
+    required = ("O_DIRECTORY", "O_NOFOLLOW")
+    if os.name != "posix" or any(not hasattr(os, name) for name in required):
+        raise StorageError("secure installer directory operations require POSIX O_NOFOLLOW")
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _installer_open_directory_at(parent_fd: int, name: str, *, mode: int) -> int:
+    created = False
+    try:
+        os.mkdir(name, mode=mode, dir_fd=parent_fd)
+        created = True
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise StorageError(f"cannot create installer directory component {name!r}: {exc}") from exc
+    try:
+        descriptor = os.open(name, _installer_directory_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise StorageError(
+            f"unsafe installer directory component {name!r}; expected a real directory: {exc}"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (linked.st_dev, linked.st_ino):
+            raise StorageError(f"installer directory component changed during validation: {name!r}")
+        if created:
+            os.fchmod(descriptor, mode)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _installer_open_absolute_directory(path: Path, *, uid: int, gid: int) -> int:
+    absolute = Path(os.path.abspath(path))
+    if not absolute.is_absolute() or absolute == Path(absolute.anchor):
+        raise StorageError(f"unsafe installer directory path: {path}")
+    components = absolute.parts[1:]
+    descriptor = os.open(absolute.anchor, _installer_directory_flags())
+    try:
+        for index, component in enumerate(components):
+            is_target = index == len(components) - 1
+            child = _installer_open_directory_at(
+                descriptor,
+                component,
+                mode=0o750 if is_target else 0o755,
+            )
+            os.close(descriptor)
+            descriptor = child
+        os.fchown(descriptor, uid, gid)
+        os.fchmod(descriptor, 0o750)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _installer_reopen_absolute_directory(path: Path) -> int:
+    absolute = Path(os.path.abspath(path))
+    descriptor = os.open(absolute.anchor, _installer_directory_flags())
+    try:
+        for component in absolute.parts[1:]:
+            child = os.open(
+                component,
+                _installer_directory_flags(),
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def secure_prepare_service_directories(
+    data_dir: Path,
+    spool_dir: Path,
+    log_dir: Path,
+    *,
+    uid: int,
+    gid: int,
+) -> None:
+    """Create/chown installer-managed directories without following symlinks.
+
+    The daemon owns the configured roots, so a compromised pre-upgrade process
+    can replace their children.  Keep descriptors open throughout preparation,
+    mutate only opened directory inodes, and verify that every pathname still
+    resolves to the same inode before returning.
+    """
+
+    if uid <= 0 or gid <= 0:
+        raise StorageError("printproxy installer requires non-root uid and gid")
+    roots: dict[Path, int] = {}
+    children: dict[str, int] = {}
+    try:
+        for path in (Path(data_dir), Path(spool_dir), Path(log_dir)):
+            roots[path] = _installer_open_absolute_directory(path, uid=uid, gid=gid)
+        spool_fd = roots[Path(spool_dir)]
+        for name in _INSTALLER_SPOOL_DIRECTORIES:
+            descriptor = _installer_open_directory_at(spool_fd, name, mode=0o750)
+            os.fchown(descriptor, uid, gid)
+            os.fchmod(descriptor, 0o750)
+            children[name] = descriptor
+
+        for name, descriptor in children.items():
+            linked = os.stat(name, dir_fd=spool_fd, follow_symlinks=False)
+            opened = os.fstat(descriptor)
+            if (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino):
+                raise StorageError(f"spool directory changed during preparation: {name!r}")
+        for path, descriptor in roots.items():
+            try:
+                reopened = _installer_reopen_absolute_directory(path)
+            except OSError as exc:
+                raise StorageError(
+                    f"service directory changed during preparation: {path}: {exc}"
+                ) from exc
+            try:
+                expected = os.fstat(descriptor)
+                actual = os.fstat(reopened)
+                if (expected.st_dev, expected.st_ino) != (actual.st_dev, actual.st_ino):
+                    raise StorageError(f"service directory changed during preparation: {path}")
+            finally:
+                os.close(reopened)
+    finally:
+        for descriptor in children.values():
+            os.close(descriptor)
+        for descriptor in roots.values():
+            os.close(descriptor)
+
+
 def ensure_runtime_directories(settings: Settings) -> None:
-    for directory in (
-        settings.data_dir,
-        settings.spool_dir,
-        settings.log_dir,
-        settings.states_dir,
-        settings.receiving_dir,
-        settings.requests_dir,
-        settings.locks_dir,
-    ):
-        validate_directory(directory, create=True)
+    if len(settings.proxy_configs) > 1:
+        # Keep the configured roots available for pre-multi-printer history,
+        # but never append new jobs to the shared root.  Every scoped Settings
+        # object below has independent ledger and crash-recovery directories.
+        for directory in (
+            settings.data_dir,
+            settings.spool_dir,
+            settings.log_dir,
+            settings.locks_dir,
+        ):
+            validate_directory(directory, create=True)
+        scoped_settings = tuple(settings.for_proxy(proxy) for proxy in settings.proxy_configs)
+    else:
+        scoped_settings = (settings,)
+
+    for scoped in scoped_settings:
+        for directory in (
+            scoped.data_dir,
+            scoped.spool_dir,
+            scoped.log_dir,
+            scoped.states_dir,
+            scoped.receiving_dir,
+            scoped.requests_dir,
+            scoped.locks_dir,
+        ):
+            validate_directory(directory, create=True)
 
 
 def _open_flags(base: int) -> int:
@@ -633,6 +970,447 @@ def read_regular_file_bytes(path: Path, *, max_bytes: int = 16 * 1024 * 1024) ->
         os.close(fd)
 
 
+_INSTALLER_ROUTE_LIST_KEYS = (
+    "LISTEN_PORT_LIST",
+    "PRINTER_IP_LIST",
+    "PRINTER_PORT_LIST",
+)
+_INSTALLER_STORAGE_PATH_KEYS = ("DATA_DIR", "SPOOL_DIR")
+_INSTALLER_STATE_MAX_BYTES = 64 * 1024
+_INSTALLER_HISTORY_STATE_MAX_BYTES = 4 * 1024 * 1024
+_INSTALLER_HISTORY_MAX_ENTRIES = 100_000
+_INSTALLER_HISTORY_MAX_STATES = 10_000
+_INSTALLER_HISTORY_MAX_STATE_BYTES = 128 * 1024 * 1024
+
+
+def _read_installer_state(path: Path) -> dict[str, str]:
+    """Read the root-owned installer state without following a symlink."""
+
+    try:
+        text = read_regular_file_bytes(path, max_bytes=_INSTALLER_STATE_MAX_BYTES).decode(
+            "utf-8"
+        )
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"installer state is not UTF-8: {path}") from exc
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise ConfigError(f"installer state line {line_number} is malformed")
+        key, value = (item.strip() for item in line.split("=", 1))
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            raise ConfigError(f"installer state line {line_number} has an unsafe key")
+        if key in values:
+            raise ConfigError(f"installer state contains duplicate key {key}")
+        values[key] = value
+    return values
+
+
+def read_installed_storage_paths(path: Path) -> tuple[Path, Path]:
+    """Read the last deployed DATA/SPOOL roots from the owned systemd drop-in.
+
+    Installer states before schema 4 did not persist storage identity.  The
+    previous installer-generated ``ReadWritePaths`` line is the only deployed
+    record of those roots, so legacy upgrades must recover it or fail closed.
+    """
+
+    try:
+        text = read_regular_file_bytes(path, max_bytes=65536).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"installed systemd path drop-in is not UTF-8: {path}") from exc
+    populated: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("ReadWritePaths="):
+            value = line.split("=", 1)[1].strip()
+            if value:
+                populated.append(value)
+    if len(populated) != 1:
+        raise ConfigError(
+            "legacy installer state has no storage identity and the deployed "
+            f"ReadWritePaths record is missing or ambiguous: {path}"
+        )
+    paths = populated[0].split()
+    if len(paths) != 3:
+        raise ConfigError(
+            f"installed ReadWritePaths must contain DATA_DIR, SPOOL_DIR and LOG_DIR: {path}"
+        )
+    return (
+        _safe_absolute_path(paths[0], "installed DATA_DIR"),
+        _safe_absolute_path(paths[1], "installed SPOOL_DIR"),
+    )
+
+
+def _validate_installer_storage_lifecycle(
+    settings: Settings,
+    state: Mapping[str, str],
+    legacy_storage_paths: tuple[Path, Path] | None,
+) -> None:
+    present = [key in state for key in _INSTALLER_STORAGE_PATH_KEYS]
+    if any(present):
+        missing = [key for key in _INSTALLER_STORAGE_PATH_KEYS if not state.get(key)]
+        if missing or not all(present):
+            raise ConfigError(
+                "installer storage state is incomplete: "
+                + ", ".join(missing or _INSTALLER_STORAGE_PATH_KEYS)
+            )
+        previous_data = _safe_absolute_path(state["DATA_DIR"], "installed DATA_DIR")
+        previous_spool = _safe_absolute_path(state["SPOOL_DIR"], "installed SPOOL_DIR")
+    else:
+        if legacy_storage_paths is None:
+            raise ConfigError(
+                "legacy installer state has no DATA_DIR/SPOOL_DIR identity; recover the "
+                "previous installer-owned systemd paths or perform an explicit migration"
+            )
+        previous_data, previous_spool = (
+            _safe_absolute_path(str(legacy_storage_paths[0]), "installed DATA_DIR"),
+            _safe_absolute_path(str(legacy_storage_paths[1]), "installed SPOOL_DIR"),
+        )
+
+    changed: list[str] = []
+    if settings.data_dir != previous_data:
+        changed.append(f"DATA_DIR {previous_data} -> {settings.data_dir}")
+    if settings.spool_dir != previous_spool:
+        changed.append(f"SPOOL_DIR {previous_spool} -> {settings.spool_dir}")
+    if changed:
+        raise ConfigError(
+            "installed storage path change is forbidden because it would strand audit/spool "
+            "history: "
+            + "; ".join(changed)
+            + ". Restore the installed paths or perform an explicit verified migration."
+        )
+
+
+def _route_signature(proxy: ProxyConfig) -> tuple[str, int, str, int]:
+    return proxy.listen_ip, proxy.listen_port, proxy.printer_ip, proxy.printer_port
+
+
+def _format_route_signature(route: tuple[str, int, str, int]) -> str:
+    listen_ip, listen_port, printer_ip, printer_port = route
+    return f"{listen_ip}:{listen_port}->{printer_ip}:{printer_port}"
+
+
+def _require_installed_routes_preserved(
+    current: tuple[ProxyConfig, ...], previous: tuple[ProxyConfig, ...]
+) -> None:
+    current_routes = {_route_signature(proxy) for proxy in current}
+    missing = [
+        _route_signature(proxy)
+        for proxy in previous
+        if _route_signature(proxy) not in current_routes
+    ]
+    if missing:
+        detail = ", ".join(_format_route_signature(route) for route in missing)
+        raise ConfigError(
+            "installed proxy route removal/replacement is forbidden: "
+            f"{detail}. Reordering and additive routes are allowed; otherwise "
+            "stop the service, verify the archive, and use explicit uninstall/migration."
+        )
+
+
+class _InstallerHistoryBudget:
+    """Bound one legacy discovery pass against directory/file amplification."""
+
+    def __init__(self) -> None:
+        self.entries_remaining = _INSTALLER_HISTORY_MAX_ENTRIES
+        self.states_remaining = _INSTALLER_HISTORY_MAX_STATES
+        self.state_bytes_remaining = _INSTALLER_HISTORY_MAX_STATE_BYTES
+
+    def entries(self, count: int, path: Path) -> None:
+        self.entries_remaining -= count
+        if self.entries_remaining < 0:
+            raise ConfigError(
+                "legacy route discovery exceeded its bounded entry limit at "
+                f"{path}; verify and migrate the archive explicitly"
+            )
+
+    def state(self, size: int, path: Path) -> None:
+        self.states_remaining -= 1
+        self.state_bytes_remaining -= size
+        if self.states_remaining < 0 or self.state_bytes_remaining < 0:
+            raise ConfigError(
+                "legacy route discovery exceeded its bounded state/byte limit at "
+                f"{path}; verify and migrate the archive explicitly"
+            )
+
+
+def _installer_directory_entries(
+    path: Path, budget: _InstallerHistoryBudget
+) -> tuple[Path, ...]:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return ()
+    except OSError as exc:
+        raise ConfigError(f"legacy history directory is unavailable: {path}: {exc}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ConfigError(f"legacy history path is not a real directory: {path}")
+    entries: list[Path] = []
+    try:
+        with os.scandir(path) as iterator:
+            for entry in iterator:
+                budget.entries(1, path)
+                entries.append(Path(entry.path))
+    except OSError as exc:
+        raise ConfigError(f"cannot scan legacy history directory {path}: {exc}") from exc
+    return tuple(sorted(entries, key=lambda item: item.name))
+
+
+def _installer_regular_info(path: Path) -> os.stat_result:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise ConfigError(f"legacy history entry is unavailable: {path}: {exc}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ConfigError(f"legacy history entry is not a regular non-symlink file: {path}")
+    return info
+
+
+def _state_route_signature(
+    path: Path, budget: _InstallerHistoryBudget
+) -> tuple[str, int, str, int]:
+    info = _installer_regular_info(path)
+    budget.state(info.st_size, path)
+    try:
+        value = json.loads(
+            read_regular_file_bytes(path, max_bytes=_INSTALLER_HISTORY_STATE_MAX_BYTES)
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, StorageError) as exc:
+        raise ConfigError(f"legacy state cannot be read safely: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ConfigError(f"legacy state is not a JSON object: {path}")
+    listen_ip = value.get("proxy_ip")
+    listen_port = value.get("proxy_port")
+    printer_ip = value.get("printer_ip")
+    printer_port = value.get("printer_port")
+    if not isinstance(listen_ip, str) or not isinstance(printer_ip, str):
+        raise ConfigError(f"legacy state has no inferable listener/printer IPv4 tuple: {path}")
+    if (
+        isinstance(listen_port, bool)
+        or not isinstance(listen_port, int)
+        or not 1 <= listen_port <= 65535
+        or isinstance(printer_port, bool)
+        or not isinstance(printer_port, int)
+        or not 1 <= printer_port <= 65535
+    ):
+        raise ConfigError(f"legacy state has no inferable listener/printer port tuple: {path}")
+    try:
+        canonical_listen = str(ipaddress.IPv4Address(listen_ip))
+        canonical_printer = str(ipaddress.IPv4Address(printer_ip))
+    except ipaddress.AddressValueError as exc:
+        raise ConfigError(f"legacy state has an invalid IPv4 endpoint: {path}: {exc}") from exc
+    return canonical_listen, listen_port, canonical_printer, printer_port
+
+
+def _manifest_head_has_history(path: Path) -> bool:
+    _installer_regular_info(path)
+    try:
+        value = json.loads(read_regular_file_bytes(path, max_bytes=65536))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, StorageError) as exc:
+        raise ConfigError(f"legacy manifest head cannot be read safely: {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ConfigError(f"legacy manifest head is not a JSON object: {path}")
+    count = value.get("record_count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ConfigError(f"legacy manifest head has an invalid record count: {path}")
+    return count > 0
+
+
+def _installer_data_history_present(
+    path: Path, budget: _InstallerHistoryBudget, *, allow_scopes: bool
+) -> tuple[bool, set[str]]:
+    history = False
+    scope_names: set[str] = set()
+    for entry in _installer_directory_entries(path, budget):
+        try:
+            info = entry.lstat()
+        except OSError as exc:
+            raise ConfigError(f"legacy archive entry is unavailable: {entry}: {exc}") from exc
+        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            try:
+                scope_name = str(ipaddress.IPv4Address(entry.name))
+            except ipaddress.AddressValueError:
+                scope_name = ""
+            if allow_scopes and scope_name == entry.name:
+                scope_names.add(scope_name)
+                continue
+            raise ConfigError(f"unexpected legacy archive directory: {entry}")
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ConfigError(f"unsafe legacy archive entry: {entry}")
+        if entry.name == "manifest.head.json":
+            history = _manifest_head_has_history(entry) or history
+        elif entry.name == "manifest.jsonl":
+            history = info.st_size > 0 or history
+        else:
+            history = True
+    return history, scope_names
+
+
+def _installer_spool_history(
+    path: Path,
+    budget: _InstallerHistoryBudget,
+    *,
+    allow_scopes: bool,
+    printer_hint: str | None,
+) -> tuple[bool, set[tuple[str, int, str, int]], set[str]]:
+    history = False
+    routes: set[tuple[str, int, str, int]] = set()
+    scope_names: set[str] = set()
+    entries = _installer_directory_entries(path, budget)
+    by_name = {entry.name: entry for entry in entries}
+    for entry in entries:
+        try:
+            info = entry.lstat()
+        except OSError as exc:
+            raise ConfigError(f"legacy spool entry is unavailable: {entry}: {exc}") from exc
+        if entry.name in {"states", "receiving", "requests", "locks"}:
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise ConfigError(f"unsafe legacy spool directory: {entry}")
+            continue
+        if entry.name == ".emergency-reserve":
+            _installer_regular_info(entry)
+            continue
+        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            try:
+                scope_name = str(ipaddress.IPv4Address(entry.name))
+            except ipaddress.AddressValueError:
+                scope_name = ""
+            if allow_scopes and scope_name == entry.name:
+                scope_names.add(scope_name)
+                continue
+            raise ConfigError(f"unexpected legacy spool directory: {entry}")
+        raise ConfigError(f"unexpected legacy spool entry without route identity: {entry}")
+
+    state_dir = by_name.get("states", path / "states")
+    state_entries = _installer_directory_entries(state_dir, budget)
+    if state_entries:
+        history = True
+    for state_path in state_entries:
+        if state_path.suffix != ".json":
+            raise ConfigError(f"unexpected legacy state entry: {state_path}")
+        route = _state_route_signature(state_path, budget)
+        if printer_hint is not None and route[2] != printer_hint:
+            raise ConfigError(
+                f"legacy state {state_path} targets {route[2]}, outside its {printer_hint} scope"
+            )
+        routes.add(route)
+
+    for directory_name in ("receiving", "requests"):
+        pending = _installer_directory_entries(path / directory_name, budget)
+        history = bool(pending) or history
+    return history, routes, scope_names
+
+
+def _legacy_installer_routes(
+    settings: Settings, legacy_listen_ips: set[str]
+) -> tuple[ProxyConfig, ...]:
+    budget = _InstallerHistoryBudget()
+    flat_data_history, data_scopes = _installer_data_history_present(
+        settings.data_dir, budget, allow_scopes=True
+    )
+    flat_spool_history, flat_routes, spool_scopes = _installer_spool_history(
+        settings.spool_dir, budget, allow_scopes=True, printer_hint=None
+    )
+    if (flat_data_history or flat_spool_history) and not flat_routes:
+        raise ConfigError(
+            "legacy flat archive/spool is non-empty but no complete route can be inferred "
+            "from bounded operational state JSON; stop, verify, and migrate it explicitly"
+        )
+
+    routes = set(flat_routes)
+    for scope_name in sorted(data_scopes | spool_scopes):
+        scoped_data_history, nested_data_scopes = _installer_data_history_present(
+            settings.data_dir / scope_name, budget, allow_scopes=False
+        )
+        if nested_data_scopes:
+            raise ConfigError(f"nested legacy archive scopes are forbidden: {scope_name}")
+        scoped_spool_history, scoped_routes, nested_spool_scopes = _installer_spool_history(
+            settings.spool_dir / scope_name,
+            budget,
+            allow_scopes=False,
+            printer_hint=scope_name,
+        )
+        if nested_spool_scopes:
+            raise ConfigError(f"nested legacy spool scopes are forbidden: {scope_name}")
+        if (scoped_data_history or scoped_spool_history) and not scoped_routes:
+            raise ConfigError(
+                f"legacy {scope_name} archive/spool is non-empty but its route cannot be "
+                "inferred from bounded operational state JSON; migrate it explicitly"
+            )
+        routes.update(scoped_routes)
+
+    for route in routes:
+        if route[0] not in legacy_listen_ips:
+            raise ConfigError(
+                "legacy state route is inconsistent with installer-owned listener IPs: "
+                f"{_format_route_signature(route)}"
+            )
+    return tuple(
+        ProxyConfig(
+            proxy_id=f"legacy-{index:03d}",
+            listen_ip=route[0],
+            listen_port=route[1],
+            printer_ip=route[2],
+            printer_port=route[3],
+        )
+        for index, route in enumerate(sorted(routes), 1)
+    )
+
+
+def _installed_routes_from_state(
+    settings: Settings, install_state_path: Path
+) -> tuple[ProxyConfig, ...]:
+    state = _read_installer_state(install_state_path)
+    mapping_fields_present = [key in state for key in _INSTALLER_ROUTE_LIST_KEYS]
+    if any(mapping_fields_present):
+        required = ("VIP_LIST", *_INSTALLER_ROUTE_LIST_KEYS)
+        missing = [key for key in required if not state.get(key)]
+        if missing or not all(mapping_fields_present):
+            detail = ", ".join(missing or _INSTALLER_ROUTE_LIST_KEYS)
+            raise ConfigError(f"installer mapping state is incomplete: {detail}")
+        return parse_proxy_configs(
+            {
+                "LISTEN_IP": state["VIP_LIST"],
+                "LISTEN_PORT": state["LISTEN_PORT_LIST"],
+                "PRINTER_IP": state["PRINTER_IP_LIST"],
+                "PRINTER_PORT": state["PRINTER_PORT_LIST"],
+            }
+        )
+
+    legacy_listen_csv = state.get("VIP_LIST") or state.get("VIP")
+    if not legacy_listen_csv:
+        raise ConfigError("legacy installer state has no listener IP identity")
+    legacy_listen_ips: set[str] = set()
+    for index, value in enumerate(_required_proxy_csv(legacy_listen_csv, "VIP_LIST"), 1):
+        canonical = _proxy_ipv4(value, "VIP_LIST", index)
+        if canonical in legacy_listen_ips:
+            raise ConfigError(f"legacy installer state contains duplicate listener IP {canonical}")
+        legacy_listen_ips.add(canonical)
+    return _legacy_installer_routes(settings, legacy_listen_ips)
+
+
+def validate_installer_route_lifecycle(
+    settings: Settings,
+    install_state_path: Path,
+    *,
+    legacy_storage_paths: tuple[Path, Path] | None = None,
+) -> None:
+    """Forbid silently orphaning or rebinding an installed printer route.
+
+    Mapping-aware installer states are authoritative.  Older states did not
+    persist ports/printers, so their historical endpoints are inferred only
+    from bounded, regular operational-state JSON files.  A non-empty history
+    without a complete endpoint is deliberately not guessed.
+    """
+
+    state = _read_installer_state(install_state_path)
+    previous = _installed_routes_from_state(settings, install_state_path)
+    _require_installed_routes_preserved(settings.proxy_configs, previous)
+    _validate_installer_storage_lifecycle(settings, state, legacy_storage_paths)
+
+
 def read_regular_file_prefix(path: Path, *, max_bytes: int) -> tuple[bytes, bool]:
     """Read at most ``max_bytes`` from one verified regular inode.
 
@@ -673,7 +1451,102 @@ def fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def atomic_write_bytes(path: Path, data: bytes, mode: int = 0o640) -> None:
+def _same_open_directory(path: Path, descriptor: int) -> bool:
+    try:
+        reopened = _installer_reopen_absolute_directory(path)
+    except OSError:
+        return False
+    try:
+        expected = os.fstat(descriptor)
+        actual = os.fstat(reopened)
+        return (expected.st_dev, expected.st_ino) == (actual.st_dev, actual.st_ino)
+    finally:
+        os.close(reopened)
+
+
+def _atomic_write_as_parent_owner(path: Path, data: bytes, mode: int) -> None:
+    """Publish one daemon-readable file through a held, no-follow directory FD."""
+
+    if os.name != "posix":
+        raise StorageError("parent-owned atomic writes require POSIX dirfd support")
+    parent = Path(path.parent)
+    try:
+        parent_fd = _installer_reopen_absolute_directory(parent)
+    except OSError as exc:
+        raise StorageError(f"request directory is unavailable or unsafe: {parent}: {exc}") from exc
+    temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    temporary_fd: int | None = None
+    renamed = False
+    try:
+        parent_info = os.fstat(parent_fd)
+        parent_mode = stat.S_IMODE(parent_info.st_mode)
+        if not stat.S_ISDIR(parent_info.st_mode) or not _same_open_directory(parent, parent_fd):
+            raise StorageError(f"request directory changed during validation: {parent}")
+        if parent_info.st_uid <= 0 or parent_info.st_gid <= 0:
+            raise StorageError(
+                f"request directory must be owned by the non-root daemon account: {parent}"
+            )
+        if parent_mode & 0o022 or parent_mode & 0o700 != 0o700:
+            raise StorageError(f"request directory has unsafe permissions {parent_mode:04o}: {parent}")
+        effective_uid = os.geteuid()
+        if effective_uid not in {0, parent_info.st_uid}:
+            raise StorageError(
+                "request creation requires root or the account owning the request directory"
+            )
+
+        temporary_fd = os.open(
+            temporary_name,
+            _open_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL),
+            mode,
+            dir_fd=parent_fd,
+        )
+        write_all(temporary_fd, data)
+        os.fchown(temporary_fd, parent_info.st_uid, parent_info.st_gid)
+        os.fchmod(temporary_fd, mode)
+        os.fsync(temporary_fd)
+        linked = os.stat(temporary_name, dir_fd=parent_fd, follow_symlinks=False)
+        opened = os.fstat(temporary_fd)
+        if (
+            not stat.S_ISREG(linked.st_mode)
+            or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
+            or not _same_open_directory(parent, parent_fd)
+        ):
+            raise StorageError("request directory or temporary file changed before publish")
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        renamed = True
+        published = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            (published.st_dev, published.st_ino) != (opened.st_dev, opened.st_ino)
+            or not _same_open_directory(parent, parent_fd)
+        ):
+            raise StorageError("request directory or file changed during publish")
+        os.fsync(parent_fd)
+    except BaseException:
+        cleanup_name = path.name if renamed else temporary_name
+        with contextlib.suppress(OSError):
+            os.unlink(cleanup_name, dir_fd=parent_fd)
+        raise
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        os.close(parent_fd)
+
+
+def atomic_write_bytes(
+    path: Path,
+    data: bytes,
+    mode: int = 0o640,
+    *,
+    inherit_parent_owner: bool = False,
+) -> None:
+    if inherit_parent_owner and os.name == "posix":
+        _atomic_write_as_parent_owner(path, data, mode)
+        return
     validate_directory(path.parent)
     temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     fd = os.open(temporary, _open_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL), mode)
@@ -691,8 +1564,19 @@ def atomic_write_bytes(path: Path, data: bytes, mode: int = 0o640) -> None:
     fsync_directory(path.parent)
 
 
-def atomic_write_json(path: Path, value: Mapping[str, Any], mode: int = 0o640) -> None:
-    atomic_write_bytes(path, canonical_json(value) + b"\n", mode=mode)
+def atomic_write_json(
+    path: Path,
+    value: Mapping[str, Any],
+    mode: int = 0o640,
+    *,
+    inherit_parent_owner: bool = False,
+) -> None:
+    atomic_write_bytes(
+        path,
+        canonical_json(value) + b"\n",
+        mode=mode,
+        inherit_parent_owner=inherit_parent_owner,
+    )
 
 
 def durable_move(source: Path, destination: Path) -> None:
@@ -889,12 +1773,21 @@ class StateStore:
                 states.append({"job_id": path.stem, "state": "QUARANTINED", "state_error": "unreadable"})
         return states
 
-    def create_request(self, request: Mapping[str, Any]) -> Path:
+    def create_request(
+        self,
+        request: Mapping[str, Any],
+        *,
+        inherit_parent_owner: bool = False,
+    ) -> Path:
         request_id = str(uuid.uuid4())
         path = self.settings.requests_dir / f"{request_id}.json"
         payload = dict(request)
         payload["request_id"] = request_id
-        atomic_write_json(path, payload)
+        atomic_write_json(
+            path,
+            payload,
+            inherit_parent_owner=inherit_parent_owner,
+        )
         return path
 
 
@@ -911,9 +1804,19 @@ class VerificationReport:
 class IntegrityLedger:
     """Append-only, hash-chained and optionally HMAC-authenticated JSONL ledger."""
 
-    def __init__(self, settings: Settings, key: bytes | None, *, repair_head: bool = True):
+    def __init__(
+        self,
+        settings: Settings,
+        key: bytes | None,
+        *,
+        repair_head: bool = True,
+        read_only: bool = False,
+    ):
+        if read_only and repair_head:
+            raise ValueError("a read-only ledger cannot repair its authenticated head")
         self.settings = settings
         self.key = key
+        self._read_only = read_only
         self._thread_lock = threading.RLock()
         self._lock_path = settings.locks_dir / "manifest.lock"
         self._last_hash = ZERO_HASH
@@ -926,6 +1829,21 @@ class IntegrityLedger:
         self._load_head_or_manifest()
         self._manifest_signature_cache = self._manifest_signature()
         self._rebuild_archive_index()
+
+    @property
+    def _route_destination(self) -> str | None:
+        """Return the authenticated storage-scope identity for multi-route ledgers.
+
+        A historical/single-route flat ledger remains deliberately unbound so
+        pre-multi-printer records continue to verify byte-for-byte.  Every
+        record created below a per-printer route scope is instead bound to the
+        immutable physical endpoint already carried by the ledger's
+        ``destination`` field.
+        """
+
+        if not self.settings.route_scoped:
+            return None
+        return f"{self.settings.printer_ip}:{self.settings.printer_port}"
 
     def _manifest_signature(self) -> tuple[int, int, int, int, int] | None:
         try:
@@ -1036,6 +1954,14 @@ class IntegrityLedger:
             raise IntegrityError(f"cannot authenticate manifest tail: {exc}") from exc
         if last.get("sequence") != self._record_count or last.get("chain_hash") != self._last_hash:
             raise IntegrityError("manifest tail differs from authenticated cached head")
+        expected_destination = self._route_destination
+        if (
+            expected_destination is not None
+            and last.get("destination") != expected_destination
+        ):
+            raise IntegrityError(
+                "manifest tail route binding does not match this physical printer scope"
+            )
         previous_hash = last.get("previous_chain_hash")
         if not isinstance(previous_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", previous_hash):
             raise IntegrityError("manifest tail previous hash is malformed")
@@ -1061,6 +1987,8 @@ class IntegrityLedger:
             raise IntegrityError("manifest tail HMAC mismatch")
 
     def append(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        if self._read_only:
+            raise IntegrityError("cannot append through a read-only ledger")
         with self._thread_lock, advisory_lock(self._lock_path, exclusive=True):
             self._validate_cached_head()
             supplied = dict(event)
@@ -1074,6 +2002,17 @@ class IntegrityLedger:
             }
             if forbidden.intersection(supplied):
                 raise IntegrityError("event attempts to override reserved ledger fields")
+            expected_destination = self._route_destination
+            if expected_destination is not None:
+                supplied_destination = supplied.get("destination")
+                if (
+                    supplied_destination is not None
+                    and supplied_destination != expected_destination
+                ):
+                    raise IntegrityError(
+                        "ledger event destination does not match this physical printer scope"
+                    )
+                supplied["destination"] = expected_destination
             event_id = str(supplied.pop("event_id", uuid.uuid4()))
             uuid.UUID(event_id)
             sequence = self._record_count + 1
@@ -1157,7 +2096,12 @@ class IntegrityLedger:
     def find_event(self, event_id: str) -> dict[str, Any] | None:
         """Find an outbox event after first validating the complete chain."""
         uuid.UUID(event_id)
-        with self._thread_lock, advisory_lock(self._lock_path, exclusive=False):
+        lock_context = (
+            contextlib.nullcontext()
+            if self._read_only
+            else advisory_lock(self._lock_path, exclusive=False)
+        )
+        with self._thread_lock, lock_context:
             self._validate_cached_head()
             if not self.settings.manifest_path.exists():
                 return None
@@ -1175,6 +2119,8 @@ class IntegrityLedger:
         repair_head: bool = False,
         already_locked: bool = False,
     ) -> VerificationReport:
+        if self._read_only and repair_head:
+            raise ValueError("a read-only ledger cannot repair its authenticated head")
         errors: list[str] = []
         warnings: list[str] = []
         previous = ZERO_HASH
@@ -1182,7 +2128,11 @@ class IntegrityLedger:
         jobs: dict[str, dict[str, Any]] = {}
         hashes_by_sequence: dict[int, str] = {0: ZERO_HASH}
 
-        lock_context = contextlib.nullcontext() if already_locked else advisory_lock(self._lock_path, exclusive=False)
+        lock_context = (
+            contextlib.nullcontext()
+            if already_locked or self._read_only
+            else advisory_lock(self._lock_path, exclusive=False)
+        )
         with lock_context:
             if self.settings.manifest_path.exists():
                 try:
@@ -1212,6 +2162,15 @@ class IntegrityLedger:
                             if raw_line != canonical_line:
                                 errors.append(
                                     f"manifest line {line_number}: serialization is not canonical"
+                                )
+                            expected_destination = self._route_destination
+                            if (
+                                expected_destination is not None
+                                and record.get("destination") != expected_destination
+                            ):
+                                errors.append(
+                                    f"manifest line {line_number}: route binding does not match "
+                                    "this physical printer scope"
                                 )
                             count += 1
                             if record.get("sequence") != count:
@@ -1508,6 +2467,105 @@ class IntegrityLedger:
             warnings=warnings,
             last_chain_hash=previous,
         )
+
+
+_MIGRATION_SAFE_TERMINAL_STATES = {
+    "SENT_UNCONFIRMED",
+    "PARTIAL",
+    "DUPLEX_ABORTED",
+    "QUARANTINED",
+    "RETENTION_DELETED",
+}
+
+
+def validate_single_to_multi_migration(
+    settings: Settings,
+    install_state_path: Path,
+    key: bytes | None,
+) -> None:
+    """Verify the legacy flat store before it becomes read-only history.
+
+    This check is intentionally offline and non-repairing.  The complete HMAC
+    ledger, referenced RAW/metadata and operational states are authenticated
+    before mutable state names are considered for terminality.  Otherwise an
+    operator or attacker could relabel a replayable root state as terminal and
+    strand it during the switch to per-printer scopes.
+    """
+
+    previous = _installed_routes_from_state(settings, install_state_path)
+    _require_installed_routes_preserved(settings.proxy_configs, previous)
+    if len(settings.proxy_configs) <= 1 or len(previous) != 1:
+        raise ConfigError(
+            "single-to-multi integrity validation requires exactly one installed route "
+            "and more than one configured route"
+        )
+    if settings.enable_hmac and key is None:
+        raise IntegrityError("single-to-multi migration requires the configured HMAC key")
+
+    previous_proxy = previous[0]
+    legacy = replace(
+        settings,
+        proxy_configs=(previous_proxy,),
+        route_scoped=False,
+    )
+    ledger = IntegrityLedger(legacy, key, repair_head=False, read_only=True)
+    report = ledger.verify(check_files=True, repair_head=False)
+    if not report.ok:
+        raise IntegrityError(
+            "legacy flat ledger/archive/state verification failed: " + "; ".join(report.errors)
+        )
+
+    budget = _InstallerHistoryBudget()
+    problems: list[str] = []
+    latest_records = ledger.latest_job_records()
+    for path in _installer_directory_entries(legacy.states_dir, budget):
+        if path.suffix != ".json":
+            problems.append(f"states/{path.name}: unexpected entry")
+            continue
+        try:
+            info = _installer_regular_info(path)
+            budget.state(info.st_size, path)
+            state = json.loads(
+                read_regular_file_bytes(path, max_bytes=_INSTALLER_HISTORY_STATE_MAX_BYTES)
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, StorageError) as exc:
+            problems.append(f"states/{path.name}: unreadable/corrupt ({type(exc).__name__})")
+            continue
+        if not isinstance(state, dict):
+            problems.append(f"states/{path.name}: state is not a JSON object")
+            continue
+        job_id = state.get("job_id")
+        valid_job_id = isinstance(job_id, str)
+        if valid_job_id:
+            try:
+                uuid.UUID(job_id)
+            except ValueError:
+                valid_job_id = False
+        if not valid_job_id or path.name != f"{job_id}.json":
+            problems.append(f"states/{path.name}: job identity mismatch")
+            continue
+        if job_id not in latest_records:
+            problems.append(f"states/{path.name}: no authenticated ledger event")
+        if (
+            state.get("proxy_ip") != previous_proxy.listen_ip
+            or state.get("proxy_port") != previous_proxy.listen_port
+            or state.get("printer_ip") != previous_proxy.printer_ip
+            or state.get("printer_port") != previous_proxy.printer_port
+        ):
+            problems.append(f"states/{path.name}: endpoint differs from installed route")
+        status = state.get("state")
+        if status not in _MIGRATION_SAFE_TERMINAL_STATES:
+            problems.append(f"states/{path.name}: unresolved state {status!r}")
+
+    for directory in (legacy.receiving_dir, legacy.requests_dir):
+        for path in _installer_directory_entries(directory, budget):
+            problems.append(f"{path.relative_to(legacy.spool_dir)}: pending")
+
+    if problems:
+        detail = "; ".join(problems[:50])
+        if len(problems) > 50:
+            detail += f"; ... and {len(problems) - 50} more"
+        raise IntegrityError(f"legacy root spool is not migration-safe: {detail}")
 
 
 CODEPAGE_BY_ESC_T = {

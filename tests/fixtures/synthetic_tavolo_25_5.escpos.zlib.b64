@@ -1,0 +1,9 @@
+# Synthetic regression fixture; it contains only invented test data.
+# Four 312x24 ESC * mode-33 bands form one 312x96 outlined raster containing
+# "Tavolo: 25-5". ESC J 48 positions each following band. Payload is zlib+b64.
+eNrtl79Kw1AUxr8YMNCldE7/JKsgpk61ixacnATBuUUzBKypbZEiii0duukrRRwc+wrXN9BNQYzn3pj2xpBSi0Mt+fgNyTk33zkn
+5AzR9/btpls1rPIWxzIMy6paVkZvKPqGWVEA3Po+UQdSUlKWimA3aUn1AyvcV18IqyGtH8OXiGWnWgOygiKQl6DbUpjSpPN5EQ9Q
+Y32oUjYfjWvJhSZVoobyCD+r/N6Nqygxj1pQXqAKNE96gQNoj1B9jkK9XUd7k9/8fYwRtCF3mFd/bvgPNNnNVd3X+MRsyowlL3kC
+hh2GSkjLw4UHvy85GJEHKfDBvyLsMmQZFAaN8WuKvImsrOAkd/OgevwwJOiWgn5QThyePcLCbiSFTZlL9e/RaMaSGPCG4Z3hleGZ
+4YFhEHO7A8ZEH2MPI2pGqjhkeErorZfAwoarua+fBLCekpKyVIS7Cb2Bgpk7sq8c99yuGrVMwcRmoiibK/eMWrvrnLhnrnHqNN1O
+t93oOpcuf5L+hg/tdkdYbWcKx/gCcMCAug==

@@ -34,7 +34,7 @@ class FakePrinter:
 class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.fake = FakePrinter()
-        self.printer_server = await asyncio.start_server(self.fake.handle, "127.0.0.1", 0)
+        self.printer_server = await asyncio.start_server(self.fake.handle, "127.0.0.2", 0)
         printer_port = int(self.printer_server.sockets[0].getsockname()[1])
         self.environment = TestEnvironment(printer_port=printer_port)
         self.settings = load_settings(self.environment.config)
@@ -136,7 +136,7 @@ class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
 class PersistentHybridTests(unittest.IsolatedAsyncioTestCase):
     async def test_idle_boundary_creates_two_non_interleaved_jobs_on_one_session(self) -> None:
         fake = FakePrinter()
-        printer_server = await asyncio.start_server(fake.handle, "127.0.0.1", 0)
+        printer_server = await asyncio.start_server(fake.handle, "127.0.0.2", 0)
         printer_port = int(printer_server.sockets[0].getsockname()[1])
         environment = TestEnvironment(printer_port=printer_port, mode="hybrid")
         settings = load_settings(environment.config)

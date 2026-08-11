@@ -31,23 +31,45 @@ get_value() {
     ' "$file"
 }
 
-[ -r "$CONF" ] || fail "missing configuration"
-ENABLED=$(get_value ENABLE_FIREWALL "$CONF")
+[ -r "$STATE" ] || fail "missing installer state"
 OWNED=$(get_value FIREWALL_OWNED "$STATE")
+case "$OWNED" in yes|no) ;; *) fail "unsafe firewall ownership in installer state" ;; esac
 if [ "${1:-}" = down ]; then
-    if [ "$OWNED" = yes ] && command -v nft >/dev/null 2>&1 && nft list table inet "$TABLE" >/dev/null 2>&1; then
-        nft delete table inet "$TABLE"
+    if [ "$OWNED" = yes ]; then
+        command -v nft >/dev/null 2>&1 || fail "nft is required to remove owned table $TABLE"
+        if nft list table inet "$TABLE" >/dev/null 2>&1; then
+            nft delete table inet "$TABLE"
+        fi
     fi
     exit 0
 fi
+[ "${1:-}" = up ] || fail "usage: $0 up|down"
+[ -r "$CONF" ] || fail "missing configuration"
+ENABLED=$(get_value ENABLE_FIREWALL "$CONF")
 [ "$ENABLED" = yes ] || exit 0
 command -v nft >/dev/null 2>&1 || fail "nft is required when ENABLE_FIREWALL=yes"
 
-VIP=$(get_value LISTEN_IP "$CONF")
-PORT=$(get_value LISTEN_PORT "$CONF")
+VIP_LIST=$(get_value LISTEN_IP "$CONF")
+PORT_LIST=$(get_value LISTEN_PORT "$CONF")
 NETWORKS=$(get_value ALLOWED_NETWORKS "$CONF")
 CLIENTS=$(get_value ALLOWED_CLIENTS "$CONF")
 [ "$OWNED" = yes ] || fail "installer state does not own nftables table $TABLE"
+
+case "$VIP_LIST" in *[!0-9.,[:space:]]*|'') fail "unsafe LISTEN_IP list" ;; esac
+case "$PORT_LIST" in *[!0-9,[:space:]]*|'') fail "unsafe LISTEN_PORT list" ;; esac
+VIP_COUNT=$(printf '%s\n' "$VIP_LIST" | awk -F, '{print NF}')
+PORT_COUNT=$(printf '%s\n' "$PORT_LIST" | awk -F, '{print NF}')
+[ "$VIP_COUNT" -eq "$PORT_COUNT" ] || fail "listener address/port count mismatch"
+
+value_at() {
+    printf '%s\n' "$1" | awk -F, -v wanted="$2" '{
+        if (wanted > NF) exit 1
+        value=$wanted
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+        if (value == "") exit 1
+        print value
+    }'
+}
 
 case "${1:-}" in
     up)
@@ -58,22 +80,29 @@ case "${1:-}" in
         fi
         printf 'add table inet %s\n' "$TABLE" >>"$RULESET"
         printf 'add chain inet %s input { type filter hook input priority -5; policy accept; }\n' "$TABLE" >>"$RULESET"
-        old_ifs=$IFS
-        IFS=,
-        SOURCES="${NETWORKS},${CLIENTS}"
-        for source in $SOURCES; do
-            source=$(printf '%s' "$source" | tr -d '[:space:]')
-            [ -n "$source" ] || continue
-            case "$source" in *[!0-9./]*) fail "unsafe ACL value" ;; esac
-            printf 'add rule inet %s input ip saddr %s ip daddr %s tcp dport %s accept\n' "$TABLE" "$source" "$VIP" "$PORT" >>"$RULESET"
+        index=1
+        while [ "$index" -le "$VIP_COUNT" ]; do
+            VIP=$(value_at "$VIP_LIST" "$index") || fail "invalid LISTEN_IP entry $index"
+            PORT=$(value_at "$PORT_LIST" "$index") || fail "invalid LISTEN_PORT entry $index"
+            case "$VIP" in *[!0-9.]*|'') fail "unsafe listener IP entry $index" ;; esac
+            case "$PORT" in *[!0-9]*|'') fail "unsafe listener port entry $index" ;; esac
+            old_ifs=$IFS
+            IFS=,
+            SOURCES="${NETWORKS},${CLIENTS}"
+            for source in $SOURCES; do
+                source=$(printf '%s' "$source" | tr -d '[:space:]')
+                [ -n "$source" ] || continue
+                case "$source" in *[!0-9./]*) fail "unsafe ACL value" ;; esac
+                printf 'add rule inet %s input ip saddr %s ip daddr %s tcp dport %s accept\n' "$TABLE" "$source" "$VIP" "$PORT" >>"$RULESET"
+            done
+            IFS=$old_ifs
+            printf 'add rule inet %s input ip daddr %s tcp dport %s drop\n' "$TABLE" "$VIP" "$PORT" >>"$RULESET"
+            index=$((index + 1))
         done
-        IFS=$old_ifs
-        printf 'add rule inet %s input ip daddr %s tcp dport %s drop\n' "$TABLE" "$VIP" "$PORT" >>"$RULESET"
         nft -c -f "$RULESET"
         nft -f "$RULESET"
         rm -f -- "$RULESET"
         trap - EXIT HUP INT TERM
         ;;
-    down) : ;;
     *) fail "usage: $0 up|down" ;;
 esac

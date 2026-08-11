@@ -53,7 +53,7 @@ class DuplexProxyTests(unittest.IsolatedAsyncioTestCase):
 
     async def start(self, fake: FakeEscPosPrinter, **config_values: str) -> None:
         self.fake = fake
-        self.printer_server = await asyncio.start_server(fake.handle, "127.0.0.1", 0)
+        self.printer_server = await asyncio.start_server(fake.handle, "127.0.0.2", 0)
         printer_port = int(self.printer_server.sockets[0].getsockname()[1])
         self.environment = TestEnvironment(printer_port=printer_port, mode="hybrid")
         enable_duplex(self.environment, **config_values)
@@ -136,7 +136,10 @@ class DuplexProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fake.received, [payload])
 
     async def test_slow_client_does_not_truncate_printer_response_tail(self) -> None:
-        response = b"R" * (4 * 1024 * 1024 + 31)
+        # One MiB is still far beyond the 4 KiB receive window and therefore
+        # keeps drain() pending past the response-idle timeout, while remaining
+        # deterministic on slow virtualized/DrvFS runners.
+        response = b"R" * (1024 * 1024 + 31)
         await self.start(
             FakeEscPosPrinter(response=response),
             PRINTER_RESPONSE_TIMEOUT="0.1",
@@ -243,10 +246,10 @@ class DuplexProxyTests(unittest.IsolatedAsyncioTestCase):
         await self.start(FakeEscPosPrinter())
         reader, writer = await self.connect()
         payload = (
-            b"\x1b@Operatore: 10/08/26  23:45\n"
-            b"\x1bE\x01Portata: 1\n\x1bE\x00"
-            b"1x Acqua friz\n   zante picc\n   ola\n"
-            b"Coperti: 1\n\x10\x04\x01"
+            b"\x1b@Demo: 01/01/00  00:00\n"
+            b"\x1bE\x01Sezione: A\n\x1bE\x00"
+            b"1x Articolo d\n   imostrativ\n   o\n"
+            b"Persone: 2\n\x10\x04\x01"
         )
         writer.write(payload)
         await writer.drain()
@@ -272,7 +275,7 @@ class DuplexProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raw_path.read_bytes(), payload)
         self.assertIn("[ESC/POS INIT]", technical_path.read_text(encoding="utf-8"))
         clean = clean_path.read_text(encoding="utf-8")
-        self.assertIn("1x Acqua frizzante piccola", clean)
+        self.assertIn("1x Articolo dimostrativo", clean)
         self.assertNotIn("[ESC/POS", clean)
         self.assertEqual(pdf_path.read_bytes()[:5], b"%PDF-")
         self.assertEqual(state["clean_sha256"], hashlib.sha256(clean_path.read_bytes()).hexdigest())
@@ -303,6 +306,7 @@ class DuplexProxyTests(unittest.IsolatedAsyncioTestCase):
         await self.start(
             FakeEscPosPrinter(response=b"\x12", respond_after_bytes=len(payload)),
             MAX_SESSION_DURATION="30",
+            MAX_JOB_DURATION="30",
             CHUNK_SIZE="65536",
             FSYNC_INTERVAL_BYTES="262144",
             ENABLE_READABLE_DUMP="no",

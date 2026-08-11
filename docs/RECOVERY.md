@@ -75,13 +75,38 @@ Il fail-closed impedisce nuovi inoltri non archiviati. Liberare spazio rimuovend
 
 ## Rollback funzionale immediato
 
-Nel gestionale:
+Nel gestionale, ripristinare ogni mapping interessato:
 
 ```text
 10.1.2.220:9100 -> 10.1.2.200:9100 RAW
+10.1.2.221:9100 -> 10.1.2.201:9100 RAW
+10.1.2.222:9100 -> 10.1.2.202:9100 RAW
 ```
 
 Non è necessario modificare Debian. Verificare una stampa diretta. Quando la continuità è ristabilita, diagnosticare il proxy senza pressione operativa.
+
+## Blocco lifecycle delle route
+
+Se `install.sh` segnala `route lifecycle`, non sostituire endpoint e non
+cancellare `/etc/printproxy/install-state`. Ripristinare temporaneamente tutte
+le tuple registrate, quindi:
+
+```bash
+sudo systemctl stop printproxy
+sudo printproxyctl verify
+sudo printproxyctl queue --all
+```
+
+Su uno state precedente allo schema 3 il servizio deve restare fermo mentre
+l’installer inferisce gli endpoint dagli state JSON. Prima dello schema 4 le
+radici storage vengono recuperate una sola volta dal drop-in systemd già
+installato; assenza, ambiguità o divergenza bloccano il rerun. Storia non vuota, state
+corrotto/mancante, symlink, limite di scansione superato o tupla non più
+presente producono un arresto fail-closed. Durante questo primo upgrade lasciare
+`DATA_DIR` e `SPOOL_DIR` sulle radici storiche, perché lo state precedente non
+registrava i percorsi. Conservare backup e HMAC key; per una
+sostituzione intenzionale seguire la procedura “Rimozione o sostituzione di una
+route” in [MULTI_PRINTER.md](MULTI_PRINTER.md).
 
 ## Uninstall
 
@@ -89,4 +114,12 @@ Non è necessario modificare Debian. Verificare una stampa diretta. Quando la co
 sudo ./uninstall.sh
 ```
 
-L’uninstall predefinito mantiene tutto ciò che serve a verificare lo storico. L’IP viene rimosso solo se `VIP_OWNED=yes`; un VIP preesistente non viene toccato. Se lo state installer manca, non indovinare manualmente: controllare `ip addr`, unit e nftables prima di rimuovere risorse.
+L’uninstall predefinito mantiene tutto ciò che serve a verificare lo storico.
+Ogni IP viene rimosso soltanto se la voce corrispondente di
+`VIP_OWNED_LIST` è `yes`; un VIP preesistente non viene toccato. Lo state schema
+3 fornisce anche `PRINTER_IP_LIST`/`PRINTER_PORT_LIST` per mostrare i rollback
+corretti anche se la config è stata modificata. L’azione VIP `down` usa soltanto
+VIP, ownership, prefisso e interfaccia registrati nello state: una lista
+stampanti accorciata non può lasciare indirizzi posseduti. Lo state schema 1 con
+`VIP_OWNED` singolo resta supportato. Se lo state installer manca, non indovinare
+manualmente: controllare `ip addr`, unit e nftables prima di rimuovere risorse.

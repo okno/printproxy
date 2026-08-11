@@ -58,6 +58,58 @@ Emulatore TCP configurabile con:
 - API parse-once per clean/PDF;
 - errore PDF restituito in modalità best-effort;
 - fsync directory verificato tramite mock nell'API integrata.
+- ricomposizione lossless di quattro bande sintetiche `312x24` in un solo raster
+  `312x96`, senza confondere immagini non correlate;
+- fixture sintetica `Tavolo: 25-5`: PDF in-page non clippato e
+  `.PULITO.txt` semantico senza `[IMMAGINE]`;
+- OCR Tesseract bounded: confidence, fallback non fatale, backend reale sulla
+  fixture sintetica quando il runtime è installato e nessun testo nei log.
+
+### `tests/test_multi_config.py`
+
+- configurazione legacy scalare con layout flat invariato;
+- tre mapping CSV posizionali, trim e `ProxyConfig` immutabili;
+- errore esplicito per lunghezze diverse, elementi vuoti, IPv4/porte invalidi;
+- rifiuto listener e stampanti fisiche duplicate;
+- directory DATA/SPOOL per IP fisico e stabilità dopo riordino delle liste.
+
+### `tests/test_multi_proxy.py`
+
+- tre listener e tre fake printer full-duplex attivi contemporaneamente;
+- byte forward/reverse esatti, nessun cross-routing e archivi segregati;
+- stampante offline senza fermare le route sane;
+- errore storage route-local isolato dalle route sane;
+- rollback atomico dei listener se un bind fallisce;
+- compatibilità runtime single-route con layout flat;
+- log OCR senza payload testuale e qualità conservata nei metadata;
+- cinque artefatti (`RAW/TXT/PULITO/PDF/JSON`) segregati per ciascuna di tre
+  route concorrenti;
+- copia di stato/ledger HMAC valido fra scope fisici diversi rifiutata prima di
+  qualsiasi connessione upstream.
+
+### `tests/test_multi_ctl.py`
+
+- `status`, `test-printer`, `self-test`, `verify` e `queue` su tutte le route;
+- `test-print` richiede `--proxy-id` quando i mapping sono più di uno;
+- retry seleziona un solo store, rifiuta ambiguità e transcript duplex;
+- richiesta retry pubblicata atomicamente con UID/GID del daemon anche quando
+  `printproxyctl` è eseguito tramite `sudo`, con difesa dal parent swap;
+- storico flat legacy visibile e read-only, con errore su lavoro stranded;
+- mismatch dell'endpoint fisico rilevato da `status`, `verify`, `queue` e
+  `retry`.
+
+### `tests/test_install_lifecycle.py`
+
+- install-state schema 4 con tuple VIP/listener/stampante e identità canonica
+  di `DATA_DIR`/`SPOOL_DIR`;
+- riordino e aggiunta di route consentiti senza cambiare lo scope fisico;
+- rimozione o sostituzione di route con storia esistente rifiutata;
+- scansione legacy bounded, regular-file/no-symlink e servizio fermo;
+- preparazione delle directory tramite dirfd/`O_NOFOLLOW`, incluso rifiuto di
+  symlink nei figli dello spool senza modificare il bersaglio;
+- prefisso VIP esattamente uguale alla subnet connessa;
+- teardown VIP/firewall basato sullo state root-owned, non sulla config
+  amministrativa mutabile.
 
 ### `tests/test_proxy.py`
 
@@ -85,7 +137,9 @@ Parser tecnico storico:
 - vettore SHA-256 noto;
 - compatibilità byte dello schema metadata v1 durante upgrade duplex;
 - chain/HMAC e tamper file;
-- riordino manifest rilevato.
+- riordino manifest rilevato;
+- binding HMAC del ledger allo scope fisico della stampante;
+- verifica offline read-only senza creazione di `manifest.lock`.
 
 ### `tests/test_spool.py`
 
@@ -120,10 +174,16 @@ failure ledger della richiesta retry e idempotenza del retry legacy.
 | client half-close | sì | stack OS del runner |
 | server-first | sì | emulatore |
 | secondo client fail-fast | sì | loopback |
-| large/fragmented payload | sì, oltre 2 MiB nel test dedicato | non è soak test 64 MiB |
+| large/fragmented payload | sì, oltre 1 MiB nel test dedicato | non è soak test 64 MiB |
 | crash recovery no replay | sì | crash state simulato |
 | quattro artefatti + JSON | sì | campione sintetico |
 | PDF con bitmap | sì | rendering software, non carta |
+| bande ESC `*` ricomposte | sì, fixture sintetica quattro-bande | RAW originale non fornito |
+| OCR testo raster | sì, engine iniettato e Tesseract reale su fixture sintetica | qualità POS80BL da collaudare |
+| tre listener concorrenti | sì | loopback su tre IPv4 distinti |
+| nessun cross-routing | sì, forward/reverse e directory | emulatore |
+| fault isolation stampante | sì, offline e storage route-local | non è un test hardware |
+| parser CSV/mapping | sì, inclusi errori e riordino | formato CSV soltanto |
 | hash sidecar/tamper | sì | threat root escluso |
 | POS80BL reale | **no** | collaudo richiesto |
 | direct-vs-proxy PCAP | **no** | rete/permesso richiesti |
@@ -135,7 +195,7 @@ failure ledger della richiesta retry e idempotenza del retry legacy.
 Ambiente Python con ReportLab:
 
 ```bash
-python3 -m pip install --disable-pip-version-check reportlab pillow
+python3 -m pip install --disable-pip-version-check reportlab pillow pypdf
 python3 -m py_compile \
   printproxy.py printproxy_core.py printproxyctl.py receipt_renderer.py
 python3 -m unittest discover -s tests -v
@@ -144,13 +204,19 @@ python3 -m unittest discover -s tests -v
 Solo duplex:
 
 ```bash
-python3 -m unittest -v tests.test_duplex_proxy
+python3 -m unittest discover -s tests -p 'test_duplex_proxy.py' -v
 ```
 
 Solo renderer:
 
 ```bash
-python3 -m unittest -v tests.test_receipt_renderer
+python3 -m unittest discover -s tests -p 'test_receipt_renderer.py' -v
+```
+
+Solo multi-printer:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_multi_*.py' -v
 ```
 
 Linux packaging:
@@ -161,33 +227,36 @@ bash -n install.sh uninstall.sh network/printproxy-vip network/printproxy-firewa
 shellcheck install.sh uninstall.sh network/printproxy-vip network/printproxy-firewall
 ```
 
-La CI configurata esegue test su Ubuntu e Windows con Python 3.11 e 3.13, più
-packaging Linux. Il risultato va letto dalla run associata al commit/tag; questo
-documento non presume che una run non ancora eseguita sia verde.
+La CI configurata installa ReportLab/Pillow e, su Linux, Tesseract con la lingua
+italiana. Esegue test su Ubuntu e Windows con Python 3.11 e 3.13, più packaging
+Linux. Il risultato va letto dalla run associata al commit/tag; questo documento
+non presume che una run non ancora eseguita sia verde.
 
 ## Esecuzione locale pre-commit osservata
 
-Il working tree corrente è stato eseguito localmente l'11 agosto 2026 su Windows
-con Python 3.14.5 e ReportLab installato:
+Il working tree congelato è stato eseguito localmente l'11 agosto 2026 su
+Windows con Python 3.14.5, ReportLab e pypdf:
 
 ```text
-RUN=72 FAILURES=0 ERRORS=0 SKIPPED=1 OK=True
+RUN=145 FAILURES=0 ERRORS=0 SKIPPED=5 OK=True
 ```
 
-Lo skip riguarda la creazione di un symlink, non autorizzata dal token Windows
-del processo (`WinError 1314`). Questo risultato è informativo e non sostituisce
-la matrice CI del commit/tag finale né il collaudo hardware.
+Gli skip Windows sono limitati a: creazione symlink senza privilegio
+(`WinError 1314`), tre test POSIX di dirfd/setuid/no-follow e il test Tesseract
+reale perché l'eseguibile non è installato su Windows.
 
-La stessa suite è stata eseguita anche sotto Linux/WSL con Python 3.13 e le
-dipendenze di rendering installate:
+La stessa snapshot è stata eseguita integralmente su Debian/WSL con Python
+3.13.5, ReportLab, pypdf, Tesseract e dati lingua italiani:
 
 ```text
-RUN=72 FAILURES=0 ERRORS=0 SKIPPED=0 OK=True
+RUN=145 FAILURES=0 ERRORS=0 SKIPPED=0 OK=True
 ```
 
-Il test di backpressure reverse usa intenzionalmente una finestra TCP minima e
-può richiedere circa due minuti su filesystem virtualizzati; la deadline del
-test è separata dai valori di produzione.
+Questo secondo gate include il backend Tesseract reale e i test POSIX/root su
+ownership, dirfd e symlink. Entrambi i risultati sono informativi e non
+sostituiscono la matrice CI del commit/tag finale né il collaudo hardware. Il
+test di backpressure reverse usa intenzionalmente una finestra TCP minima; la
+deadline del test è separata dai valori di produzione.
 
 ## Record di esecuzione release
 

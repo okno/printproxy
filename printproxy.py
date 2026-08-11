@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Durable, serialized RAW TCP print proxy for Debian."""
+"""Durable multi-route, full-duplex RAW TCP print proxy for Debian."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import struct
 import sys
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,6 +37,7 @@ from printproxy_core import (  # noqa: E402
     ConfigError,
     IntegrityError,
     IntegrityLedger,
+    ProxyConfig,
     SAFE_RETRY_STATES,
     STATE_SCHEMA_VERSION,
     STATE_LATEST_EVENTS,
@@ -68,6 +70,7 @@ from printproxy_core import (  # noqa: E402
 )
 from receipt_renderer import (  # noqa: E402
     ParseLimits,
+    RasterTextBlock,
     RealtimeStatusBlock,
     render_receipt_artifacts,
 )
@@ -75,10 +78,21 @@ from receipt_renderer import (  # noqa: E402
 
 LOG = logging.getLogger("printproxy")
 
+# Each listener and every task it creates carries an immutable route context.
+# Context variables are copied when asyncio creates a task, so simultaneous
+# proxy instances cannot overwrite one another's structured log fields.
+_PROXY_LOG_CONTEXT: ContextVar[tuple[tuple[str, str], ...]] = ContextVar(
+    "printproxy_route_log_context", default=()
+)
+
 
 def log_event(level: int, event: str, **fields: Any) -> None:
+    contextual_fields = dict(fields)
+    # The route context is authoritative.  Call sites may add job/session
+    # fields, but cannot accidentally relabel an event as another proxy.
+    contextual_fields.update(_PROXY_LOG_CONTEXT.get())
     safe_fields = []
-    for key, value in fields.items():
+    for key, value in contextual_fields.items():
         text = str(value).replace("\r", " ").replace("\n", " ")[:500]
         safe_fields.append(f"{key.upper()}={text}")
     LOG.log(level, "%s %s", event, " ".join(safe_fields))
@@ -657,8 +671,42 @@ class DurableScheduler:
 
 
 class PrintProxyService:
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        proxy_config: ProxyConfig | None = None,
+    ):
+        if len(settings.proxy_configs) != 1:
+            raise ConfigError(
+                "PrintProxyService requires route-scoped settings; "
+                "use MultiProxyService for multiple mappings"
+            )
         self.settings = settings
+        self.proxy_config = proxy_config or settings.proxy_configs[0]
+        if (
+            self.settings.listen_ip != self.proxy_config.listen_ip
+            or self.settings.listen_port != self.proxy_config.listen_port
+            or self.settings.printer_ip != self.proxy_config.printer_ip
+            or self.settings.printer_port != self.proxy_config.printer_port
+        ):
+            raise ConfigError(
+                f"{self.proxy_config.proxy_id}: route-scoped settings do not match ProxyConfig"
+            )
+        self.route_log_fields: tuple[tuple[str, str], ...] = (
+            ("proxy_id", self.proxy_config.proxy_id),
+            (
+                "listen",
+                f"{self.proxy_config.listen_ip}:{self.proxy_config.listen_port}",
+            ),
+            (
+                "printer",
+                f"{self.proxy_config.printer_ip}:{self.proxy_config.printer_port}",
+            ),
+            ("listen_ip", self.proxy_config.listen_ip),
+            ("listen_port", str(self.proxy_config.listen_port)),
+            ("printer_ip", self.proxy_config.printer_ip),
+            ("printer_port", str(self.proxy_config.printer_port)),
+        )
         ensure_runtime_directories(settings)
         # Ledger construction may repair the one-record durable tail window.
         # Free the reserve before that first possible write, not only in run().
@@ -678,8 +726,28 @@ class PrintProxyService:
         self.client_tasks: set[asyncio.Task[Any]] = set()
         self.background_tasks: list[asyncio.Task[Any]] = []
         self.server: asyncio.AbstractServer | None = None
+        self.prepared = False
+        self.workers_started = False
+        self.stopped = False
         self._random = random.SystemRandom()
         self.fatal_exception: BaseException | None = None
+
+    @contextlib.contextmanager
+    def _route_log_context(self):
+        token = _PROXY_LOG_CONTEXT.set(self.route_log_fields)
+        try:
+            yield
+        finally:
+            _PROXY_LOG_CONTEXT.reset(token)
+
+    async def _handle_routed_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        # asyncio invokes this callback for every accepted connection.  Set the
+        # context inside the callback so it remains correct even when listeners
+        # accept concurrently on the same event loop.
+        with self._route_log_context():
+            await self._handle_client(reader, writer)
 
     def request_fatal_shutdown(self, exc: BaseException) -> None:
         current: BaseException | None = exc
@@ -691,8 +759,9 @@ class PrintProxyService:
             current = current.__cause__
         if self.fatal_exception is None:
             self.fatal_exception = exc
-            log_event(logging.CRITICAL, "SERVICE_FATAL", error=safe_error(exc))
-        self.request_shutdown()
+            with self._route_log_context():
+                log_event(logging.CRITICAL, "SERVICE_FATAL", error=safe_error(exc))
+        self.request_shutdown(reason="fatal_route_error")
 
     def _raw_path(self, state: dict[str, Any]) -> Path:
         filename = str(state["raw_filename"])
@@ -719,6 +788,29 @@ class PrintProxyService:
 
     def _metadata_document(self, state: dict[str, Any]) -> dict[str, Any]:
         return metadata_document_from_state(state)
+
+    def _validate_physical_route(self, state: dict[str, Any]) -> None:
+        """Bind durable job evidence to its configured physical printer.
+
+        All routes intentionally share one integrity key, so a valid state,
+        metadata document, and ledger can otherwise be copied between route
+        directories. Listener identity is deliberately not checked: VIPs and
+        proxy ordering may change, while a job must never move to another
+        physical printer.
+        """
+        printer_ip = state.get("printer_ip")
+        printer_port = state.get("printer_port")
+        if (
+            not isinstance(printer_ip, str)
+            or printer_ip != self.proxy_config.printer_ip
+            or isinstance(printer_port, bool)
+            or not isinstance(printer_port, int)
+            or printer_port != self.proxy_config.printer_port
+        ):
+            raise IntegrityError(
+                "authenticated job printer endpoint does not match "
+                "the configured physical route"
+            )
 
     def _event_payload(
         self, state: dict[str, Any], event: str, event_id: str
@@ -839,6 +931,7 @@ class PrintProxyService:
     def _validate_latest_metadata_file(
         self, state: dict[str, Any]
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        self._validate_physical_route(state)
         latest = self.ledger.latest_job_record(state["job_id"])
         if latest is None:
             return None, None
@@ -891,6 +984,7 @@ class PrintProxyService:
         return record
 
     def _reconcile_pending_event(self, state: dict[str, Any]) -> dict[str, Any]:
+        self._validate_physical_route(state)
         pending = state.get("pending_ledger_event")
         if pending is None:
             return state
@@ -1607,6 +1701,7 @@ class PrintProxyService:
                 )
             succeeded = 0
             expected = int(clean_path is not None) + int(pdf_path is not None)
+            pdf_content_truncated = False
             if clean_path is not None:
                 if rendered.clean_text_error is None and clean_path.is_file():
                     state["clean_sha256"] = (await asyncio.to_thread(sha256_file, clean_path))[0]
@@ -1620,6 +1715,12 @@ class PrintProxyService:
                 if rendered.pdf is not None and rendered.pdf.success and pdf_path.is_file():
                     state["pdf_sha256"] = (await asyncio.to_thread(sha256_file, pdf_path))[0]
                     succeeded += 1
+                    pdf_content_truncated = rendered.pdf.content_truncated
+                    if pdf_content_truncated:
+                        sidecar_errors.append(
+                            "receipt PDF: content truncated at configured maximum "
+                            "height; authoritative RAW is unaffected"
+                        )
                 else:
                     sidecar_errors.append(
                         "receipt PDF: "
@@ -1632,9 +1733,50 @@ class PrintProxyService:
             state["render_status"] = (
                 "complete" if succeeded == expected else "partial" if succeeded else "failed"
             )
+            if pdf_content_truncated:
+                # The PDF file is valid, but it is not a complete rendering of
+                # the authoritative RAW.  This metadata is persisted with the
+                # normal archive event; delivery/printing state is untouched.
+                state["render_status"] = "partial"
             state["parsed_realtime_status_queries"] = sum(
                 isinstance(node, RealtimeStatusBlock) for node in rendered.document.nodes
             )
+            raster_text_blocks = tuple(
+                node
+                for node in rendered.document.nodes
+                if isinstance(node, RasterTextBlock)
+            )
+            if raster_text_blocks:
+                confidences = ",".join(
+                    f"{block.ocr_confidence:.2f}" for block in raster_text_blocks
+                )
+                bounding_boxes = json.dumps(
+                    [block.bounding_box for block in raster_text_blocks],
+                    separators=(",", ":"),
+                )
+                bitmap_sources = json.dumps(
+                    [block.source_bitmap.source for block in raster_text_blocks],
+                    separators=(",", ":"),
+                )
+                # Never log OCR text: a receipt can contain sensitive customer
+                # or order information.  Successful OCR quality/provenance is
+                # an operational audit event, not a sidecar error.  Keep it out
+                # of authenticated schema-v2 metadata so historical documents
+                # remain byte-for-byte compatible.
+                with self._route_log_context():
+                    log_event(
+                        logging.INFO,
+                        "OCR_RASTER_TEXT",
+                        job_id=state["job_id"],
+                        provenance="receipt_renderer:raster_ocr",
+                        blocks=len(raster_text_blocks),
+                        confidences=confidences,
+                        bboxes=bounding_boxes,
+                        bitmap_sources=bitmap_sources,
+                    )
+            for warning in rendered.document.warnings:
+                safe_warning = str(warning).replace("\r", " ").replace("\n", " ")[:400]
+                sidecar_errors.append("receipt rendering warning: " + safe_warning)
             if rendered.document.truncated:
                 sidecar_errors.append(
                     "receipt rendering input was bounded; authoritative RAW is complete"
@@ -1874,6 +2016,7 @@ class PrintProxyService:
                 self.client_tasks.discard(task)
 
     def _open_validated_raw(self, state: dict[str, Any]) -> int:
+        self._validate_physical_route(state)
         archive = self.ledger.archive_record(state["job_id"])
         if archive is None:
             raise IntegrityError("no authenticated ARCHIVED event exists for job")
@@ -1918,6 +2061,7 @@ class PrintProxyService:
         os.close(fd)
 
     def _validate_operational_state(self, state: dict[str, Any]) -> None:
+        self._validate_physical_route(state)
         latest, metadata_document = self._validate_latest_metadata_file(state)
         if latest is None:
             raise IntegrityError("job has no authenticated operational event")
@@ -1969,6 +2113,7 @@ class PrintProxyService:
             raise IntegrityError("invalid authenticated retry timestamp") from exc
 
     def _validate_recovery_state(self, state: dict[str, Any]) -> None:
+        self._validate_physical_route(state)
         current = state.get("state")
         latest = self.ledger.latest_job_record(state["job_id"])
         if current == "RECEIVING":
@@ -2377,6 +2522,7 @@ class PrintProxyService:
     def _retention_paths(
         self, state: dict[str, Any]
     ) -> tuple[Path, Path, Path, Path, Path, Path]:
+        self._validate_physical_route(state)
         archive = self.ledger.archive_record(state["job_id"])
         if archive is None or (
             archive.get("raw_filename") != state.get("raw_filename")
@@ -2420,6 +2566,7 @@ class PrintProxyService:
             fsync_directory(self.settings.states_dir)
 
     async def _recover_receiving(self, state: dict[str, Any]) -> None:
+        self._validate_physical_route(state)
         job_id = state["job_id"]
         temp_name = state.get("receiving_filename", f"{job_id}.raw.tmp")
         if temp_name != f"{job_id}.raw.tmp":
@@ -2447,6 +2594,7 @@ class PrintProxyService:
         await self._seal_result(result)
 
     async def _recover_sealed(self, state: dict[str, Any]) -> None:
+        self._validate_physical_route(state)
         job_id = state["job_id"]
         temp_name = state.get("receiving_filename", f"{job_id}.raw.tmp")
         if temp_name != f"{job_id}.raw.tmp":
@@ -2622,9 +2770,10 @@ class PrintProxyService:
                     + summary
                 )
 
-    def request_shutdown(self) -> None:
+    def request_shutdown(self, reason: str = "signal") -> None:
         if not self.shutdown_event.is_set():
-            log_event(logging.INFO, "SERVICE_STOP", reason="signal")
+            with self._route_log_context():
+                log_event(logging.INFO, "SERVICE_STOP", reason=reason)
             self.shutdown_event.set()
             if self.server is not None:
                 self.server.close()
@@ -2636,63 +2785,153 @@ class PrintProxyService:
         if exception is not None:
             self.request_fatal_shutdown(exception)
 
-    async def run(self) -> None:
+    async def prepare(self) -> None:
+        """Recover this route before any listener becomes reachable."""
+        if self.prepared:
+            return
         # Recovery gets first use of reserved blocks. Recreating the reserve
         # before reconciling a pending manifest/head write can deadlock ENOSPC
         # recovery across every systemd restart.
-        with contextlib.suppress(OSError):
-            release_emergency_reserve(self.settings)
-        await self.recover()
-        reserve_needed = self.settings.emergency_reserve_mb
-        if reserve_needed > 0:
-            free_mb = min(
-                disk_free_mb(self.settings.spool_dir), disk_free_mb(self.settings.data_dir)
-            )
-            if free_mb >= self.settings.min_free_disk_mb + reserve_needed:
-                try:
-                    create_emergency_reserve(self.settings)
-                except OSError as exc:
+        with self._route_log_context():
+            with contextlib.suppress(OSError):
+                release_emergency_reserve(self.settings)
+            await self.recover()
+            reserve_needed = self.settings.emergency_reserve_mb
+            if reserve_needed > 0:
+                free_mb = min(
+                    disk_free_mb(self.settings.spool_dir),
+                    disk_free_mb(self.settings.data_dir),
+                )
+                if free_mb >= self.settings.min_free_disk_mb + reserve_needed:
+                    try:
+                        create_emergency_reserve(self.settings)
+                    except OSError as exc:
+                        log_event(
+                            logging.ERROR,
+                            "EMERGENCY_RESERVE_UNAVAILABLE",
+                            error=safe_error(exc),
+                        )
+                else:
                     log_event(
                         logging.ERROR,
-                        "EMERGENCY_RESERVE_UNAVAILABLE",
-                        error=safe_error(exc),
+                        "EMERGENCY_RESERVE_SKIPPED",
+                        free_mb=free_mb,
+                        required_mb=self.settings.min_free_disk_mb + reserve_needed,
                     )
-            else:
+            self.prepared = True
+
+    @staticmethod
+    def _bind_failure_reason(exc: OSError, listen_ip: str) -> str:
+        code = exc.errno if exc.errno is not None else getattr(exc, "winerror", None)
+        if code in {errno.EADDRNOTAVAIL, 10049}:
+            return f"IP address {listen_ip} is not configured on this host"
+        if code in {errno.EADDRINUSE, 10048}:
+            return "listener address is already in use"
+        if code in {errno.EACCES, 10013}:
+            return "permission denied while binding listener"
+        return safe_error(exc)
+
+    def _log_listener_started(self) -> None:
+        assert self.server is not None
+        with self._route_log_context():
+            for bound in self.server.sockets or []:
+                log_event(
+                    logging.INFO,
+                    "SERVICE_START",
+                    listener=bound.getsockname(),
+                    jobs=self.settings.data_dir,
+                    pid=os.getpid(),
+                )
+
+    async def bind_listener(self, *, start_serving: bool = True) -> None:
+        """Bind one listener; callers can roll back earlier binds atomically."""
+        if not self.prepared:
+            raise RuntimeError("proxy route must be prepared before listener bind")
+        if self.server is not None:
+            raise RuntimeError("proxy listener is already bound")
+        try:
+            server = await asyncio.start_server(
+                self._handle_routed_client,
+                host=self.settings.listen_ip,
+                port=self.settings.listen_port,
+                limit=self.settings.chunk_size,
+                start_serving=start_serving,
+            )
+        except OSError as exc:
+            reason = self._bind_failure_reason(exc, self.settings.listen_ip)
+            with self._route_log_context():
                 log_event(
                     logging.ERROR,
-                    "EMERGENCY_RESERVE_SKIPPED",
-                    free_mb=free_mb,
-                    required_mb=self.settings.min_free_disk_mb + reserve_needed,
+                    "LISTENER_BIND_FAILED",
+                    reason=reason,
+                    error=safe_error(exc),
                 )
-        self.server = await asyncio.start_server(
-            self._handle_client,
-            host=self.settings.listen_ip,
-            port=self.settings.listen_port,
-            limit=self.settings.chunk_size,
-            start_serving=True,
-        )
-        sockets = self.server.sockets or []
-        for bound in sockets:
-            log_event(logging.INFO, "SERVICE_START", listener=bound.getsockname(), pid=os.getpid())
-        self.background_tasks = [
-            asyncio.create_task(self._request_worker(), name="request-worker"),
-        ]
-        if not self.settings.full_duplex:
-            self.background_tasks.append(
-                asyncio.create_task(self._forward_worker(), name="printer-forwarder")
-            )
-        if self.settings.enable_retention:
-            self.background_tasks.append(
-                asyncio.create_task(self._retention_worker(), name="retention-worker")
-            )
-        for task in self.background_tasks:
-            task.add_done_callback(self._supervise_background)
-        await self.shutdown_event.wait()
-        self.server.close()
-        await self.server.wait_closed()
-        if self.client_tasks:
-            done, pending = await asyncio.wait(
-                set(self.client_tasks), timeout=self.settings.shutdown_grace_seconds
+            raise OSError(
+                exc.errno,
+                (
+                    f"{self.proxy_config.proxy_id}: cannot bind listener "
+                    f"{self.settings.listen_ip}:{self.settings.listen_port}: {reason}"
+                ),
+            ) from exc
+        self.server = server
+        if start_serving:
+            self._log_listener_started()
+        else:
+            with self._route_log_context():
+                log_event(logging.INFO, "LISTENER_BOUND_PENDING_ACTIVATION")
+
+    async def activate_listener(self) -> None:
+        if self.server is None:
+            raise RuntimeError("proxy listener must be bound before activation")
+        if not self.server.is_serving():
+            await self.server.start_serving()
+        self._log_listener_started()
+
+    def start_workers(self) -> None:
+        if self.server is None:
+            raise RuntimeError("proxy listener must be bound before workers start")
+        if self.workers_started:
+            return
+        with self._route_log_context():
+            suffix = self.proxy_config.proxy_id
+            self.background_tasks = [
+                asyncio.create_task(
+                    self._request_worker(), name=f"request-worker-{suffix}"
+                ),
+            ]
+            if not self.settings.full_duplex:
+                self.background_tasks.append(
+                    asyncio.create_task(
+                        self._forward_worker(), name=f"printer-forwarder-{suffix}"
+                    )
+                )
+            if self.settings.enable_retention:
+                self.background_tasks.append(
+                    asyncio.create_task(
+                        self._retention_worker(), name=f"retention-worker-{suffix}"
+                    )
+                )
+            for task in self.background_tasks:
+                task.add_done_callback(self._supervise_background)
+            self.workers_started = True
+
+    async def start(self) -> None:
+        await self.prepare()
+        await self.bind_listener()
+        self.start_workers()
+
+    async def stop(self) -> None:
+        """Close only this route and wait for its clients and workers."""
+        if self.stopped:
+            return
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+        current = asyncio.current_task()
+        clients = {task for task in self.client_tasks if task is not current}
+        if clients:
+            _, pending = await asyncio.wait(
+                clients, timeout=self.settings.shutdown_grace_seconds
             )
             for task in pending:
                 task.cancel()
@@ -2701,6 +2940,126 @@ class PrintProxyService:
         for task in self.background_tasks:
             task.cancel()
         await asyncio.gather(*self.background_tasks, return_exceptions=True)
+        self.stopped = True
+        with self._route_log_context():
+            log_event(logging.INFO, "PROXY_INSTANCE_STOPPED")
+
+    async def wait_until_stopped(self, *, raise_fatal: bool) -> None:
+        await self.shutdown_event.wait()
+        await self.stop()
+        if raise_fatal and self.fatal_exception is not None:
+            raise IntegrityError(safe_error(self.fatal_exception))
+
+    async def run(self) -> None:
+        try:
+            await self.start()
+            await self.wait_until_stopped(raise_fatal=True)
+        except BaseException:
+            await self.stop()
+            raise
+
+
+class MultiProxyService:
+    """One process supervising independently isolated proxy routes."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.services = tuple(
+            PrintProxyService(settings.for_proxy(proxy), proxy)
+            for proxy in settings.proxy_configs
+        )
+        if not self.services:
+            raise ConfigError("at least one proxy mapping is required")
+        self.shutdown_event = asyncio.Event()
+        self.child_tasks: list[asyncio.Task[None]] = []
+        self.started = False
+        self.fatal_exception: BaseException | None = None
+
+    @property
+    def servers(self) -> tuple[asyncio.AbstractServer, ...]:
+        return tuple(
+            service.server
+            for service in self.services
+            if service.server is not None and service.server.is_serving()
+        )
+
+    def request_shutdown(self) -> None:
+        if self.shutdown_event.is_set():
+            return
+        log_event(logging.INFO, "MULTI_PROXY_STOP", configured=len(self.services))
+        self.shutdown_event.set()
+        for service in self.services:
+            service.request_shutdown(reason="service_shutdown")
+
+    async def _rollback_startup(self) -> None:
+        log_event(
+            logging.ERROR,
+            "MULTI_PROXY_STARTUP_ROLLBACK",
+            configured=len(self.services),
+        )
+        for service in self.services:
+            service.request_shutdown(reason="startup_rollback")
+        await asyncio.gather(
+            *(service.stop() for service in self.services), return_exceptions=True
+        )
+
+    async def _supervise_route(self, service: PrintProxyService) -> None:
+        await service.wait_until_stopped(raise_fatal=False)
+        if service.fatal_exception is not None:
+            with service._route_log_context():
+                log_event(
+                    logging.CRITICAL,
+                    "PROXY_INSTANCE_FAILED_ISOLATED",
+                    error=safe_error(service.fatal_exception),
+                )
+            if not self.shutdown_event.is_set() and all(
+                item.shutdown_event.is_set() for item in self.services
+            ):
+                self.fatal_exception = RuntimeError("all proxy routes failed")
+                self.shutdown_event.set()
+
+    async def run(self) -> None:
+        # Recover every route before binding any listener.  Listener binding is
+        # then transactional: if route N fails, routes 1..N-1 are closed before
+        # the exception reaches systemd.
+        try:
+            for service in self.services:
+                await service.prepare()
+            for service in self.services:
+                await service.bind_listener(start_serving=False)
+            activation_results = await asyncio.gather(
+                *(service.activate_listener() for service in self.services),
+                return_exceptions=True,
+            )
+            for result in activation_results:
+                if isinstance(result, BaseException):
+                    raise result
+            for service in self.services:
+                service.start_workers()
+        except BaseException:
+            await self._rollback_startup()
+            raise
+
+        self.child_tasks = [
+            asyncio.create_task(
+                self._supervise_route(service),
+                name=f"proxy-supervisor-{service.proxy_config.proxy_id}",
+            )
+            for service in self.services
+        ]
+        self.started = True
+        log_event(
+            logging.INFO,
+            "MULTI_PROXY_START",
+            configured=len(self.services),
+            pid=os.getpid(),
+        )
+        try:
+            await self.shutdown_event.wait()
+        finally:
+            self.request_shutdown()
+            await asyncio.gather(*self.child_tasks, return_exceptions=True)
+            self.started = False
         if self.fatal_exception is not None:
             raise IntegrityError(safe_error(self.fatal_exception))
 
@@ -2717,14 +3076,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         settings = load_settings(arguments.config)
         if arguments.check_config:
-            print(f"configuration valid: {settings.config_path}")
+            print(
+                f"configuration valid: {settings.config_path} "
+                f"({len(settings.proxy_configs)} proxy mapping(s))"
+            )
             return 0
         ensure_runtime_directories(settings)
         configure_logging(settings)
         key = load_hmac_key(settings)
         del key
         with service_instance_lock(settings):
-            service = PrintProxyService(settings)
+            service = MultiProxyService(settings)
 
             async def runner() -> None:
                 loop = asyncio.get_running_loop()

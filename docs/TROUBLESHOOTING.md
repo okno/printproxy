@@ -59,10 +59,19 @@ systemctl status printproxy-vip --no-pager -l
 journalctl -u printproxy-vip -b --no-pager
 ip route get 10.1.2.200
 ip -4 addr show dev enp1s0
+ss -H -ltn4 'sport = :9100'
+journalctl -u printproxy -b --no-pager
 ```
 
 Il servizio non effettua fallback a `0.0.0.0`. Correggere route, conflitto DAD o
 interfaccia e riavviare `printproxy-vip`, poi `printproxy`.
+
+Se l'installer segnala `configured listener socket is not active` ma il journal
+mostra `SERVICE_START`, la release corrente verifica una tuple `LISTEN` esatta
+in `/proc/net/tcp`: non apre una connessione e non crea job. Un vecchio probe TCP
+locale poteva invece essere bloccato dall'ACL o dal firewall pur con il socket
+attivo. Verificare la tuple con `ss`, quindi usare il codice installer della
+stessa release installata.
 
 ### ReportLab mancante
 
@@ -75,6 +84,18 @@ dpkg -s python3-reportlab
 
 Una dipendenza PDF mancante non deve alterare il relay, ma rende incompleto il
 set obbligatorio di artefatti e compare come errore renderer.
+
+### Tesseract o lingua italiana mancanti
+
+```bash
+command -v tesseract
+tesseract --list-langs | grep -E '^(ita|eng)$'
+dpkg -s tesseract-ocr tesseract-ocr-ita
+```
+
+L'OCR è fail-safe: RAW e PDF restano validi, ma una bitmap testuale può apparire
+come `[IMMAGINE]` nel `.PULITO.txt`. Cercare warning OCR e non sostituire il testo
+con valori hardcoded.
 
 ## Il gestionale non si connette
 
@@ -93,7 +114,9 @@ route. `CLIENT_REJECTED` produce RST prima della creazione del job.
 sudo printproxyctl test-printer
 ```
 
-Non conferma DLE EOT, stampa o carta.
+Il comando mostra tutte le route e non conferma DLE EOT, stampa o carta. Se un
+solo listener manca, cercare `LISTENER_BIND_FAILED` con il relativo `proxy_id` e
+verificare tutti i `LISTEN_IP` con `ip -br -4 addr`.
 
 ## Il secondo client riceve RST
 
@@ -223,6 +246,13 @@ Una fusione di righe avviene solo per item chiaramente wrapped. Se righe
 distinte vengono unite, conservare il RAW di esempio e aggiungere un test prima
 di modificare l'euristica.
 
+Se il raster contiene testo ma resta `[IMMAGINE]`, verificare nell'ordine:
+
+1. che il `.txt` mostri la sequenza completa `BIT_IMAGE`/`FEED_DOTS`;
+2. che il PDF abbia un'unica regione composta, senza bande separate;
+3. presenza delle lingue Tesseract;
+4. warning, bounding box e confidence OCR nel JSON/journal.
+
 ## PDF mancante o malformato
 
 Controllare:
@@ -230,8 +260,11 @@ Controllare:
 ```bash
 grep -E '^(SAVE_PDF|PDF_WIDTH_MM|MAX_CONCURRENT_SIDECARS)=' \
   /etc/printproxy/printproxy.conf
-pdfinfo /var/lib/printproxy/jobs/<job>.pdf
+pdfinfo /var/lib/printproxy/jobs/<PRINTER_IP>/<job>.pdf
 ```
+
+Il layout flat `/var/lib/printproxy/jobs/<job>.pdf` resta soltanto per una
+configurazione single-route/legacy.
 
 Nel JSON esaminare `render_status`, `sidecar_errors`, `pdf_filename` e
 `pdf_sha256`. Un errore PDF non deve diventare errore di stampa; il set
@@ -239,6 +272,11 @@ archivistico resta però incompleto finché il PDF non viene rigenerato dal RAW.
 
 QR/barcode nel PDF sono placeholder conservativi e non sono garantiti
 scansionabili. Le bitmap ESC `*` e GS `v 0` devono invece apparire realmente.
+
+Se un elemento `ESC *` appare diviso in bande, usare `pdfimages -list` o pypdf:
+una sequenza ricostruita deve risultare un solo raster logico (nel caso di
+regressione `312x96`, non quattro immagini `312x24`). Non aumentare margini o
+altezza pagina: il difetto è nel doppio avanzamento immagine+feed.
 
 ## Risposta catturata troncata
 

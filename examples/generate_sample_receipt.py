@@ -18,7 +18,7 @@ from receipt_renderer import render_receipt_artifacts  # noqa: E402
 
 
 def raster_command() -> bytes:
-    """Build a 384-dot ESC/POS GS v 0 image resembling the photographed header."""
+    """Build an invented 384-dot ESC/POS GS v 0 demonstration image."""
 
     from PIL import Image, ImageDraw, ImageFont
 
@@ -39,7 +39,7 @@ def raster_command() -> bytes:
             pass
     if font is None:
         font = ImageFont.load_default()
-    label = "Tavolo: 25-B"
+    label = "Tavolo: TEST-01"
     bounds = draw.textbbox((0, 0), label, font=font)
     text_width = bounds[2] - bounds[0]
     text_height = bounds[3] - bounds[1]
@@ -73,13 +73,13 @@ def raster_command() -> bytes:
 def sample_raw() -> bytes:
     return (
         b"\x1b@\x1bt\x13"
-        b"Operatore: 10/08/26  23:45\n\n"
+        b"Demo: 01/01/00  00:00\n\n"
         + raster_command()
-        + b"\n\x1bE\x01\x1d!\x11Portata: 1\n"
+        + b"\n\x1bE\x01\x1d!\x11Sezione: A\n"
         b"\x1bE\x00\x1d!\x00--------------------------\n"
         b"\x1d!\x00\x1bE\x00"
-        b"1x Acqua friz\n   zante picc\n   ola\n\n"
-        b"\x1ba\x01\x1d!\x10\x1bE\x01Coperti: 1\n"
+        b"1x Articolo d\n   imostrativ\n   o\n\n"
+        b"\x1ba\x01\x1d!\x10\x1bE\x01Persone: 2\n"
         b"\x1dV\x00\x1bp\x00\x19\xfa\x10\x04\x01"
     )
 
@@ -89,7 +89,7 @@ def main() -> int:
     parser.add_argument("output_dir", type=Path)
     arguments = parser.parse_args()
     arguments.output_dir.mkdir(parents=True, exist_ok=True)
-    stem = "2026-08-10T23-45-00.000000Z_sample-receipt"
+    stem = "2000-01-01T00-00-00.000000Z_sample-receipt"
     raw_path = arguments.output_dir / f"{stem}.raw"
     technical_path = arguments.output_dir / f"{stem}.txt"
     clean_path = arguments.output_dir / f"{stem}.PULITO.txt"
@@ -108,7 +108,7 @@ def main() -> int:
     )
     metadata = {
         "sample": True,
-        "source": "synthetic fixture reconstructed from the supplied receipt transcript/photo",
+        "source": "fully synthetic demonstration data",
         "raw_file": raw_path.name,
         "technical_txt_file": technical_path.name,
         "clean_txt_file": clean_path.name,
