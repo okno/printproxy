@@ -1,5 +1,17 @@
 # Printproxy RAW/JetDirect full-duplex
 
+> [!IMPORTANT]
+> **Repository autonomo congelato.** Questa codebase resta disponibile come
+> ultima implementazione standalone di `printproxy` e conserva la propria
+> documentazione operativa, ma non riceverà nuove funzionalità.
+> Correzioni, supporto multi-stampante, deployment e sviluppo antifrode
+> proseguono nel monorepo
+> [RetailPrintGuard](https://github.com/okno/RetailPrintGuard), dove i proxy POS
+> rimangono processi indipendenti dal database, dall'API e dalla web app.
+> Per nuove installazioni usare RetailPrintGuard; mantenere questo repository
+> soltanto per audit, rollback controllato e manutenzione di installazioni
+> legacy già esistenti.
+
 Printproxy è un proxy TCP trasparente multi-stampante per stampe di cortesia
 RAW/ESC-POS. Il gestionale si collega a uno degli indirizzi virtuali del server
 Debian; la `ProxyInstance` associata apre una sessione verso la stampante reale,
